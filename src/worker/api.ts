@@ -1,10 +1,11 @@
 import { capBucket, isCategory, isNegotiable, OTHER_CAP } from '../shared/categories';
-import { isBuiltInPayee, learnRules } from '../shared/categorise';
+import { isBuiltInPayee, isCashPayee, learnRules } from '../shared/categorise';
 import { addDays, formatDate, isYmd, monthOf, ppDate, weekDeadline, weekEnd, weekStart } from '../shared/dates';
 import { bankForLabel } from '../shared/history';
-import { round2, sameMoney } from '../shared/money';
+import { CSV_ROWS_PER_REQUEST, csvHashable } from '../shared/csv';
+import { round2, sameMoney, usd } from '../shared/money';
 import { maskPayee, payeeKey } from '../shared/privacy';
-import { sha256Hex } from '../shared/hash';
+import { hashRows, sha256Hex, sha256HexSync, txIdentity } from '../shared/hash';
 import { checkProof } from '../shared/proof';
 import { accountStatus, findUnlogged, penaltyMonth, savedInWindow, savingsWindow, DEATH_SAVINGS_PENALTY } from '../shared/scoring';
 import { DEFAULT_SETTINGS, phaseValue, validateSettings, type Phase, type Settings } from '../shared/settings';
@@ -160,22 +161,27 @@ async function buildState(db: D1Database, core: Core, now: number) {
 
 // ---------- Uploads ----------
 
+const BANK_CURRENCY = { ABA: 'USD', REV: 'GBP' } as const;
+/** Rows per confirm request. Bigger statements are sent in parts (see shared/submit.ts) to stay under 10 ms CPU. */
+const MAX_CONFIRM_ROWS = 300;
+const MAX_CHECK_ROWS = 6000;
+
 interface StatementIn extends StatementSummary {
   bank: 'ABA' | 'REV';
   last3: string;
   fx: number;
 }
 
-function parseStatementIn(v: unknown): StatementIn {
+function parseStatementIn(v: unknown, today: string): StatementIn {
   const o = (v ?? {}) as Record<string, unknown>;
   const bank = o.bank === 'ABA' || o.bank === 'REV' ? o.bank : null;
   if (!bank) throw bad('Unknown bank.');
-  const currency = o.currency === 'USD' || o.currency === 'GBP' ? o.currency : null;
-  if (!currency) throw bad('Unknown currency.');
+  // Each bank's statements have one currency: ABA in USD, Revolut in GBP.
+  if (o.currency !== BANK_CURRENCY[bank]) throw bad(`${bank === 'REV' ? 'Revolut' : 'ABA'} statements must be in ${BANK_CURRENCY[bank]}.`);
   const last3 = str(o.last3, 'last3', 3);
   if (!/^\d{3}$/.test(last3)) throw bad('Account digits must be 3 numbers.');
   const st: StatementIn = {
-    bank, currency, last3,
+    bank, currency: BANK_CURRENCY[bank], last3,
     accountId: str(o.accountId, 'accountId', 40),
     periodStart: ymd(o.periodStart, 'periodStart'),
     periodEnd: ymd(o.periodEnd, 'periodEnd'),
@@ -183,35 +189,44 @@ function parseStatementIn(v: unknown): StatementIn {
     opening: num(o.opening, 'opening'),
     closing: num(o.closing, 'closing'),
     fx: num(o.fx, 'fx'),
+    direction: o.direction === 'backfill' ? 'backfill' : undefined,
   };
   if (st.periodEnd < st.periodStart) throw bad('Statement period is backwards.');
+  // A statement can't prove days that haven't happened yet.
+  if (st.periodEnd > today) throw bad(`The statement runs to ${formatDate(st.periodEnd)}, which is after today. Nothing was saved.`);
   return st;
 }
 
 interface RowIn {
-  hash: string; date: string; time: string | null; payee: string; amountOrig: number; amountUsd: number; balance: number;
-  category: string; savings: boolean; isCash: boolean; seq: number;
+  clientHash: string | null; date: string; time: string | null; payee: string; amountOrig: number; amountUsd: number; balance: number;
+  category: string; savings: boolean; isCash: boolean; dup: number; seq: number;
 }
 
-function parseRows(v: unknown, st: StatementIn): RowIn[] {
-  if (!Array.isArray(v) || v.length > 5000) throw bad('Too many rows (max 5000 per statement).');
+function parseRows(v: unknown, st: StatementIn, max: number): RowIn[] {
+  if (!Array.isArray(v) || v.length > max) throw bad(`Too many rows in one request (max ${max}).`);
+  if (v.length === 0 && !st.periodFromHeader) throw bad('A statement with no rows needs its dates from the statement header.');
   return v.map((x, i) => {
     const o = (x ?? {}) as Record<string, unknown>;
-    const hash = str(o.hash, 'hash', 64);
-    if (!HEX64.test(hash)) throw bad(`Row ${i + 1}: bad hash.`);
+    const clientHash = typeof o.hash === 'string' && HEX64.test(o.hash) ? o.hash : null;
     const date = ymd(o.date, `Row ${i + 1} date`);
     if (date < st.periodStart || date > st.periodEnd) throw bad(`Row ${i + 1} is outside the statement period.`);
     const time = o.time === null || o.time === undefined ? null : str(o.time, 'time', 5);
     if (time !== null && !/^\d{2}:\d{2}$/.test(time)) throw bad(`Row ${i + 1}: bad time.`);
     const category = str(o.category, 'category', 40);
     if (!isCategory(category)) throw bad(`Row ${i + 1}: unknown category.`);
+    const dup = o.dup === undefined ? 0 : num(o.dup, 'dup');
+    if (!Number.isInteger(dup) || dup < 0 || dup > 1000) throw bad(`Row ${i + 1}: bad duplicate number.`);
+    const payee = maskPayee(str(o.payee, 'payee', 300, true)) || '(no description)';
+    const amountOrig = num(o.amountOrig, 'amountOrig');
+    const amountUsd = num(o.amountUsd, 'amountUsd');
     return {
-      hash, date, time,
-      payee: maskPayee(str(o.payee, 'payee', 300, true)) || '(no description)',
-      amountOrig: num(o.amountOrig, 'amountOrig'),
-      amountUsd: num(o.amountUsd, 'amountUsd'),
+      clientHash, date, time, payee, amountOrig, amountUsd,
       balance: num(o.balance, 'balance'),
-      category, savings: !!o.savings, isCash: !!o.isCash, seq: i,
+      category, dup, seq: i,
+      // Worked out here, never taken from the browser: cash is a cash withdrawal going out;
+      // savings can only be money going out as a Transfer or Investing.
+      isCash: amountUsd > 0 && isCashPayee(payee),
+      savings: !!o.savings && amountUsd > 0 && (category === 'Transfer' || category === 'Investing'),
     };
   });
 }
@@ -222,22 +237,33 @@ function checkFx(core: Core, st: StatementIn) {
   if (st.currency === 'USD' && st.fx !== 1) throw bad('USD statements must not be converted.');
 }
 
-async function proofFor(db: D1Database, core: Core, st: StatementIn, rows: { hash: string; balance: number }[], now: number) {
+function accountFor(core: Core, st: StatementIn) {
   const acct = core.accounts.find((a) => a.id === st.accountId);
-  const accountOk = !!acct && acct.active && acct.bank === st.bank && acct.last3 === st.last3;
-  const accountDetail = accountOk
-    ? `${acct!.label} (ending ${acct!.last3}).`
-    : `This statement is for ${st.bank === 'REV' ? 'Revolut' : 'ABA'} ending ${st.last3}, which isn't an active account in Settings.`;
-  const good = core.uploads.filter((u) => u.accountId === st.accountId && u.ok).sort((a, b) => (a.periodEnd < b.periodEnd ? -1 : a.periodEnd > b.periodEnd ? 1 : a.uploadedAt - b.uploadedAt));
-  const lastGood = good[good.length - 1] ?? null;
+  const ok = !!acct && acct.active && acct.bank === st.bank && acct.last3 === st.last3;
+  return {
+    ok,
+    detail: ok ? `${acct!.label} (ending ${acct!.last3}).` : `This statement is for ${st.bank === 'REV' ? 'Revolut' : 'ABA'} ending ${st.last3}, which isn't an active account in Settings.`,
+  };
+}
+
+function goodUploads(core: Core, accountId: string) {
+  return core.uploads.filter((u) => u.accountId === accountId && u.ok);
+}
+
+async function proofFor(db: D1Database, core: Core, st: StatementIn, rows: { hash: string; balance: number }[], now: number) {
+  const acct = accountFor(core, st);
+  const good = goodUploads(core, st.accountId);
+  const lastGood = [...good].sort((a, b) => (a.periodEnd < b.periodEnd ? -1 : a.periodEnd > b.periodEnd ? 1 : a.uploadedAt - b.uploadedAt)).pop() ?? null;
+  const firstGood = [...good].sort((a, b) => (a.periodStart < b.periodStart ? -1 : a.periodStart > b.periodStart ? 1 : a.uploadedAt - b.uploadedAt))[0] ?? null;
   const known = new Set<string>();
   if (rows.length) {
-    const r = await db.prepare(`SELECT hash FROM transactions WHERE hash IN (SELECT value FROM json_each(?1))`).bind(JSON.stringify(rows.map((x) => x.hash))).all<{ hash: string }>();
+    // Only this account's statement rows count as "already saved".
+    const r = await db.prepare(`SELECT hash FROM transactions WHERE account_id = ?2 AND source = 'pdf' AND hash IN (SELECT value FROM json_each(?1))`)
+      .bind(JSON.stringify(rows.map((x) => x.hash)), st.accountId).all<{ hash: string }>();
     for (const x of r.results) known.add(x.hash);
   }
-  const firstGood = [...good].sort((a, b) => (a.periodStart < b.periodStart ? -1 : a.periodStart > b.periodStart ? 1 : a.uploadedAt - b.uploadedAt))[0] ?? null;
   return checkProof({
-    statement: st, rows, knownHashes: known, today: ppDate(now), accountOk, accountDetail,
+    statement: st, rows, knownHashes: known, today: ppDate(now), accountOk: acct.ok, accountDetail: acct.detail,
     lastGood: lastGood ? { periodEnd: lastGood.periodEnd, closing: lastGood.closing } : null,
     firstGood: firstGood ? { periodStart: firstGood.periodStart, opening: firstGood.opening } : null,
   });
@@ -247,8 +273,7 @@ async function proofFor(db: D1Database, core: Core, st: StatementIn, rows: { has
 function checkChain(st: StatementIn, rows: RowIn[]) {
   let bal = st.opening;
   for (const r of rows) {
-    const inOut = -r.amountOrig; // amountOrig is spend-positive
-    bal = round2(bal + inOut);
+    bal = round2(bal - r.amountOrig); // amountOrig is spend-positive
     if (!sameMoney(bal, r.balance)) throw bad('Rows do not add up to their running balances.');
     const expectUsd = st.currency === 'GBP' ? round2(r.amountOrig * st.fx) : r.amountOrig;
     if (!sameMoney(expectUsd, r.amountUsd, 0.011)) throw bad('USD amounts do not match the exchange rate.');
@@ -256,52 +281,85 @@ function checkChain(st: StatementIn, rows: RowIn[]) {
   if (!sameMoney(bal, st.closing)) throw bad('Rows do not add up to the closing balance.');
 }
 
-export async function checkUpload(db: D1Database, body: unknown, now: number) {
+/**
+ * Read a statement for checking only. Nothing is stored from it, and every part is fully re-checked
+ * on confirm, so only row ids and balances are needed: this keeps a 6000-row check cheap.
+ */
+async function readForCheck(db: D1Database, body: unknown, now: number) {
   const o = (body ?? {}) as Record<string, unknown>;
-  const st = parseStatementIn(o.statement);
-  const rows = parseRows(o.rows, st);
-  checkChain(st, rows);
+  const st = parseStatementIn(o.statement, ppDate(now));
+  if (!Array.isArray(o.rows) || o.rows.length > MAX_CHECK_ROWS) throw bad(`Too many rows (max ${MAX_CHECK_ROWS}).`);
+  if (o.rows.length === 0 && !st.periodFromHeader) throw bad('A statement with no rows needs its dates from the statement header.');
+  const rows = (o.rows as Record<string, unknown>[]).map((r, i) => {
+    if (typeof r?.hash !== 'string' || !HEX64.test(r.hash)) throw bad(`Row ${i + 1}: bad id. Pick the file again.`);
+    return { hash: r.hash, balance: num(r.balance, 'balance') };
+  });
+  if (rows.length && !sameMoney(rows[rows.length - 1].balance, st.closing)) throw bad('Rows do not add up to the closing balance.');
   const core = await loadCore(db, now, weekStart(ppDate(now)));
   checkFx(core, st);
-  return proofFor(db, core, st, rows, now);
+  const acct = accountFor(core, st);
+  if (!acct.ok) throw bad(acct.detail);
+  const proof = await proofFor(db, core, st, rows, now);
+  return { st, rows, proof };
 }
 
+export async function checkUpload(db: D1Database, body: unknown, now: number) {
+  return (await readForCheck(db, body, now)).proof;
+}
+
+/** Record that a statement failed its proof check (so the deadline counts it as "failing"). Stores no rows. */
+export async function recordFailedUpload(db: D1Database, body: unknown, now: number) {
+  const { st, rows, proof } = await readForCheck(db, body, now);
+  if (proof.ok) throw bad('This statement passes its checks now. Confirm it instead.');
+  await db.prepare(`INSERT INTO uploads (id, account_id, uploaded_at, period_start, period_end, opening, closing, currency, row_count, new_rows, ok, baseline, checks) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 0, 0, ?10)`)
+    .bind(crypto.randomUUID(), st.accountId, now, st.periodStart, st.periodEnd, st.opening, st.closing, st.currency, rows.length, JSON.stringify(proof.checks)).run();
+  return { proof, stored: false };
+}
+
+/** Save one statement, or one part of a big one. Row ids are computed here, never taken from the browser. */
 export async function confirmUpload(db: D1Database, body: unknown, now: number) {
   const o = (body ?? {}) as Record<string, unknown>;
-  const st = parseStatementIn(o.statement);
-  const rows = parseRows(o.rows, st);
+  const st = parseStatementIn(o.statement, ppDate(now));
+  const rows = parseRows(o.rows, st, MAX_CONFIRM_ROWS);
   checkChain(st, rows);
-  const rules = Array.isArray(o.rules) ? o.rules.slice(0, 2000) : [];
+  const hashes = await hashRows(st.accountId, rows, rows.map((r) => r.dup));
+  const rules = Array.isArray(o.rules) ? o.rules.slice(0, 500) : [];
 
   // Score any weeks whose deadline passed BEFORE this upload, so a late upload can't rescue them.
   const first = await evaluateAndLoad(db, now);
   const core = first.core;
   checkFx(core, st);
-  const proof = await proofFor(db, core, st, rows, now);
-  const accountCheck = proof.checks.find((c) => c.id === 'account');
-  if (!accountCheck?.ok) throw bad(accountCheck?.detail ?? 'Wrong account.');
+  const acct = accountFor(core, st);
+  if (!acct.ok) throw bad(acct.detail);
+  const proof = await proofFor(db, core, st, rows.map((r, i) => ({ hash: hashes[i], balance: r.balance })), now);
 
   const uploadId = crypto.randomUUID();
-  const stmts: D1PreparedStatement[] = [
+  const stmts: D1PreparedStatement[] = [];
+  if (proof.ok) {
+    // Two uploads for one account at the same moment would both chain from the same balance.
+    // Each saved upload takes the next number for its account; a clash rolls the whole batch back.
+    const seq = goodUploads(core, st.accountId).length + 1;
+    stmts.push(db.prepare(`INSERT INTO upload_seq (account_id, seq) VALUES (?1, ?2)`).bind(st.accountId, seq));
+  }
+  stmts.push(
     db.prepare(`INSERT INTO uploads (id, account_id, uploaded_at, period_start, period_end, opening, closing, currency, row_count, new_rows, ok, baseline, checks) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`)
       .bind(uploadId, st.accountId, now, st.periodStart, st.periodEnd, st.opening, st.closing, st.currency, rows.length, proof.ok ? proof.newRows : 0, proof.ok ? 1 : 0, proof.baseline ? 1 : 0, JSON.stringify(proof.checks)),
-  ];
-  let inserted = 0;
+  );
+  const insertAt = stmts.length;
+  if (proof.ok && rows.length) {
+    const data = rows.map((r, i) => ({ h: hashes[i], d: r.date, t: r.time, p: r.payee, o: r.amountOrig, u: r.amountUsd, b: r.balance, c: r.category, s: r.savings ? 1 : 0, x: r.isCash ? 1 : 0, q: r.seq }));
+    stmts.push(
+      db.prepare(
+        `INSERT OR IGNORE INTO transactions (hash, account_id, bank, source, date, time, payee, amount_orig, currency, amount_usd, balance, category, savings, is_cash, upload_id, seq)
+         SELECT json_extract(value,'$.h'), ?2, ?3, 'pdf', json_extract(value,'$.d'), json_extract(value,'$.t'), json_extract(value,'$.p'), json_extract(value,'$.o'), ?4, json_extract(value,'$.u'), json_extract(value,'$.b'), json_extract(value,'$.c'), json_extract(value,'$.s'), json_extract(value,'$.x'), ?5, json_extract(value,'$.q')
+         FROM json_each(?1)`,
+      ).bind(JSON.stringify(data), st.accountId, st.bank, st.currency, uploadId),
+    );
+  }
   if (proof.ok) {
-    // Only statements that pass every proof check are stored. One INSERT per 400 rows (D1 free plan: 50 queries per request).
-    for (let i = 0; i < rows.length; i += 400) {
-      const chunk = rows.slice(i, i + 400).map((r) => ({ h: r.hash, d: r.date, t: r.time, p: r.payee, o: r.amountOrig, u: r.amountUsd, b: r.balance, c: r.category, s: r.savings ? 1 : 0, x: r.isCash ? 1 : 0, q: r.seq }));
-      stmts.push(
-        db.prepare(
-          `INSERT OR IGNORE INTO transactions (hash, account_id, bank, source, date, time, payee, amount_orig, currency, amount_usd, balance, category, savings, is_cash, upload_id, seq)
-           SELECT json_extract(value,'$.h'), ?2, ?3, 'pdf', json_extract(value,'$.d'), json_extract(value,'$.t'), json_extract(value,'$.p'), json_extract(value,'$.o'), ?4, json_extract(value,'$.u'), json_extract(value,'$.b'), json_extract(value,'$.c'), json_extract(value,'$.s'), json_extract(value,'$.x'), ?5, json_extract(value,'$.q')
-           FROM json_each(?1)`,
-        ).bind(JSON.stringify(chunk), st.accountId, st.bank, st.currency, uploadId),
-      );
-    }
     const ruleRows: { k: string; c: string }[] = [];
     for (const r of rules as Record<string, unknown>[]) {
-      if (typeof r?.payee !== 'string' || typeof r?.category !== 'string' || !isCategory(r.category) || r.category === 'Unidentified') continue;
+      if (typeof r?.payee !== 'string' || r.payee.length > 300 || typeof r?.category !== 'string' || !isCategory(r.category) || r.category === 'Unidentified') continue;
       if (isBuiltInPayee(r.payee)) continue;
       const k = payeeKey(r.payee);
       if (k) ruleRows.push({ k, c: r.category });
@@ -315,8 +373,14 @@ export async function confirmUpload(db: D1Database, body: unknown, now: number) 
       );
     }
   }
-  const res = await db.batch(stmts);
-  for (const r of res.slice(1, 1 + Math.ceil(rows.length / 400))) inserted += r.meta.changes ?? 0;
+  let res: D1Result[];
+  try {
+    res = await db.batch(stmts);
+  } catch (e) {
+    if (String(e).includes('UNIQUE')) throw new HttpError(409, 'Another statement for this account was saved at the same moment. Pick the file again.');
+    throw e;
+  }
+  const inserted = proof.ok && rows.length ? (res[insertAt].meta.changes ?? 0) : 0;
 
   // Now score the finished week early if every statement is in.
   const second = await evaluateAndLoad(db, now);
@@ -324,7 +388,7 @@ export async function confirmUpload(db: D1Database, body: unknown, now: number) 
   const scored = [first.outcome, second.outcome].filter(Boolean) as EvalOutcome[];
   return {
     proof,
-    inserted: proof.ok ? inserted : 0,
+    inserted,
     stored: proof.ok,
     healthBefore: before,
     healthAfter: second.core.creature.health,
@@ -347,6 +411,7 @@ export async function addLog(db: D1Database, body: unknown, now: number) {
   if (kind === 'cash' && !category) throw bad('Pick what the cash was spent on.');
   const date = o.date ? ymd(o.date, 'Date') : ppDate(now);
   if (kind === 'planned' && date < addDays(ppDate(now), -1)) throw bad('Write it down before paying: the date can be at most yesterday.');
+  if (date > addDays(ppDate(now), 7)) throw bad('That date is more than a week away.');
   const id = crypto.randomUUID();
   if (cashTxHash) {
     const w = await db.prepare(`SELECT amount_usd, (SELECT COALESCE(SUM(amount_usd),0) FROM logs WHERE cash_tx_hash = ?1) AS logged FROM transactions WHERE hash = ?1 AND is_cash = 1`).bind(cashTxHash).first<{ amount_usd: number; logged: number }>();
@@ -354,15 +419,25 @@ export async function addLog(db: D1Database, body: unknown, now: number) {
     if (w.logged + amount > w.amount_usd + 0.01) throw bad(`Only $${(w.amount_usd - w.logged).toFixed(2)} of that withdrawal is left to log.`);
   }
   await db.prepare(`INSERT INTO logs (id, created_at, date, amount_usd, what, why, kind, category, urgent, cash_tx_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`)
-    .bind(id, now, date, round2(amount), str(o.what, 'What', 120), str(o.why ?? '', 'Why', 300, true), kind, category, o.urgent ? 1 : 0, cashTxHash).run();
+    .bind(id, now, date, round2(amount), maskPayee(str(o.what, 'What', 120)), maskPayee(str(o.why ?? '', 'Why', 300, true)), kind, category, o.urgent ? 1 : 0, cashTxHash).run();
   return { id };
 }
 
+/** Has this week already been scored (on time, early or late)? Its inputs must then stay as they were. */
+async function weekScored(db: D1Database, weekStartYmd: string): Promise<boolean> {
+  const r = await db.prepare(`SELECT (SELECT data_ok FROM week_evals WHERE week_start = ?1) AS ok, (SELECT 1 FROM late_evals WHERE week_start = ?1) AS late`).bind(weekStartYmd).first<{ ok: number | null; late: number | null }>();
+  return !!r && (r.ok === 1 || r.late === 1);
+}
+
 export async function deleteLog(db: D1Database, id: string, now: number) {
-  // Entries already used in a scored week are kept, so the score log stays honest.
-  const l = await db.prepare(`SELECT created_at FROM logs WHERE id = ?1`).bind(id).first<{ created_at: number }>();
+  // Entries a scored week relied on are kept, so the score log stays honest.
+  if (id.length > 64) throw bad('Bad id.');
+  const l = await db.prepare(`SELECT l.created_at, l.date, l.kind, t.date AS cash_date FROM logs l LEFT JOIN transactions t ON t.hash = l.cash_tx_hash WHERE l.id = ?1`).bind(id).first<{ created_at: number; date: string; kind: string; cash_date: string | null }>();
   if (!l) throw new HttpError(404, 'Not found.');
   if (now - l.created_at > 24 * 3600e3) throw bad('Entries older than a day can’t be deleted.');
+  // A "before I pay" note can match spending up to 2 days later; a cash note changes the withdrawal's week.
+  const weeks = l.kind === 'cash' && l.cash_date ? [weekStart(l.cash_date)] : [weekStart(l.date), weekStart(addDays(l.date, 2))];
+  for (const w of weeks) if (await weekScored(db, w)) throw bad('This entry was used when a week was scored, so it has to stay.');
   await db.prepare(`DELETE FROM logs WHERE id = ?1`).bind(id).run();
   return { ok: true };
 }
@@ -415,11 +490,35 @@ export async function saveSettings(db: D1Database, body: unknown, now: number) {
   if (next.savingsAccountId && !core.accounts.some((a) => a.id === next.savingsAccountId)) throw bad('Savings account must be one of your accounts.');
   const errs = validateSettings(next);
   if (errs.length) throw bad(errs.join(' '));
-  await db.batch([
+  const stmts = [
     db.prepare(`INSERT INTO meta (key, value) VALUES ('settings', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(JSON.stringify(next)),
     db.prepare(`UPDATE creatures SET name = ?1 WHERE died_at IS NULL`).bind(next.creatureName),
-  ]);
+  ];
+  // Changing the rules is allowed, but it shows up in the score log so it's never invisible.
+  const changes = settingsChanges(core.settings, next);
+  if (changes.length) stmts.push(settingsEvent(db, core, now, `Settings changed: ${changes.join('; ')}.`));
+  await db.batch(stmts);
   return { settings: next };
+}
+
+function phasesText(p: Phase<number>[]): string {
+  return p.map((x) => `${usd(x.value)}${x.until ? ` until ${x.until}` : ''}`).join(', then ');
+}
+
+function settingsChanges(a: Settings, b: Settings): string[] {
+  const out: string[] = [];
+  if (JSON.stringify(a.allowance) !== JSON.stringify(b.allowance)) out.push(`weekly allowance ${phasesText(a.allowance)} → ${phasesText(b.allowance)}`);
+  if (JSON.stringify(a.savingsTarget) !== JSON.stringify(b.savingsTarget)) out.push(`savings target ${phasesText(a.savingsTarget)} → ${phasesText(b.savingsTarget)}`);
+  if (JSON.stringify(a.caps) !== JSON.stringify(b.caps)) out.push('monthly caps edited');
+  if (a.fxGbpUsd !== b.fxGbpUsd) out.push(`GBP→USD rate ${a.fxGbpUsd} → ${b.fxGbpUsd}`);
+  if (a.deliveryWeeklyCap !== b.deliveryWeeklyCap) out.push(`delivery cap ${usd(a.deliveryWeeklyCap)} → ${usd(b.deliveryWeeklyCap)}`);
+  if (a.savingsAccountId !== b.savingsAccountId || JSON.stringify(a.savingsKeywords) !== JSON.stringify(b.savingsKeywords)) out.push('savings account or keywords changed');
+  return out;
+}
+
+function settingsEvent(db: D1Database, core: Core, now: number, reason: string): D1PreparedStatement {
+  return db.prepare(`INSERT INTO score_events (creature_id, week_start, kind, delta, reason, at, health_after) VALUES (?1, ?2, 'settings', 0, ?3, ?4, ?5)`)
+    .bind(core.creature.id, weekStart(ppDate(now)), reason.slice(0, 500), now, core.creature.health);
 }
 
 // ---------- Transactions added by hand ----------
@@ -456,14 +555,15 @@ export async function addManualTx(db: D1Database, body: unknown, now: number) {
 
 export async function deleteManualTx(db: D1Database, hash: string, now: number) {
   if (!HEX64.test(hash)) throw bad('Bad id.');
-  const t = await db.prepare(`SELECT created_at FROM transactions WHERE hash = ?1 AND source = 'manual'`).bind(hash).first<{ created_at: number }>();
+  const t = await db.prepare(`SELECT created_at, date FROM transactions WHERE hash = ?1 AND source = 'manual'`).bind(hash).first<{ created_at: number; date: string }>();
   if (!t) throw new HttpError(404, 'Not found.');
   if (now - Number(t.created_at) > 24 * 3600e3) throw bad('Hand-added transactions older than a day can’t be deleted.');
+  if (await weekScored(db, weekStart(t.date))) throw bad('That week has already been scored with this transaction, so it has to stay.');
   await db.prepare(`DELETE FROM transactions WHERE hash = ?1 AND source = 'manual'`).bind(hash).run();
   return { ok: true };
 }
 
-export async function saveAccount(db: D1Database, body: unknown) {
+export async function saveAccount(db: D1Database, body: unknown, now: number) {
   const o = (body ?? {}) as Record<string, unknown>;
   const bank = o.bank === 'ABA' || o.bank === 'REV' ? o.bank : null;
   if (!bank) throw bad('Bank must be ABA or Revolut.');
@@ -471,9 +571,23 @@ export async function saveAccount(db: D1Database, body: unknown) {
   if (!/^\d{3}$/.test(last3)) throw bad('Enter exactly the last 3 digits.');
   const id = `${bank}-${last3}`;
   const label = str(o.label ?? `${bank === 'REV' ? 'Revolut' : 'ABA'} ${last3}`, 'Label', 40);
-  await db.prepare(`INSERT INTO accounts (id, bank, last3, label, optional, active, sort) VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT COALESCE(MAX(sort),0)+1 FROM accounts))
-                    ON CONFLICT(id) DO UPDATE SET label = excluded.label, optional = excluded.optional, active = excluded.active`)
-    .bind(id, bank, last3, label, o.optional ? 1 : 0, o.active === false ? 0 : 1).run();
+  const core = await loadCore(db, now, weekStart(ppDate(now)));
+  const prev = core.accounts.find((a) => a.id === id);
+  const optional = !!o.optional;
+  const active = o.active !== false;
+  const stmts = [
+    db.prepare(`INSERT INTO accounts (id, bank, last3, label, optional, active, sort) VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT COALESCE(MAX(sort),0)+1 FROM accounts))
+                ON CONFLICT(id) DO UPDATE SET label = excluded.label, optional = excluded.optional, active = excluded.active`)
+      .bind(id, bank, last3, maskPayee(label), optional ? 1 : 0, active ? 1 : 0),
+  ];
+  const changes: string[] = [];
+  if (!prev) changes.push(`added ${label}${optional ? ' (optional)' : ''}`);
+  else {
+    if (prev.optional !== optional) changes.push(`${prev.label} is now ${optional ? 'optional' : 'required'}`);
+    if (prev.active !== active) changes.push(`${prev.label} ${active ? 'switched on' : 'switched off'}`);
+  }
+  if (changes.length) stmts.push(settingsEvent(db, core, now, `Accounts changed: ${changes.join('; ')}.`));
+  await db.batch(stmts);
   return { id };
 }
 
@@ -481,23 +595,30 @@ export async function saveAccount(db: D1Database, body: unknown) {
 
 export async function importCsv(db: D1Database, body: unknown, now: number) {
   const o = (body ?? {}) as Record<string, unknown>;
-  if (!Array.isArray(o.rows) || o.rows.length === 0 || o.rows.length > 20000) throw bad('Expected 1–20000 rows.');
+  if (!Array.isArray(o.rows) || o.rows.length === 0 || o.rows.length > CSV_ROWS_PER_REQUEST) throw bad(`Expected 1–${CSV_ROWS_PER_REQUEST} rows per request.`);
   const core = await loadCore(db, now, weekStart(ppDate(now)));
-  const rows = (o.rows as Record<string, unknown>[]).map((r, i) => {
-    const hash = str(r.hash, 'hash', 64);
-    if (!HEX64.test(hash)) throw bad(`Row ${i + 1}: bad hash.`);
+  const parsed = (o.rows as Record<string, unknown>[]).map((r, i) => {
     const account = str(r.account, 'account', 40);
     const category = str(r.category, 'category', 40);
     if (!isCategory(category)) throw bad(`Row ${i + 1}: unknown category.`);
-    const match = /^\d{3}$/.test(account) ? core.accounts.find((a) => a.last3 === account) : core.accounts.find((a) => a.id === account);
+    const dup = r.dup === undefined ? 0 : num(r.dup, 'dup');
+    if (!Number.isInteger(dup) || dup < 0 || dup > 10000) throw bad(`Row ${i + 1}: bad duplicate number.`);
+    const payee = str(r.payee, 'payee', 300);
+    return { account, category, dup, payee, date: ymd(r.date, `Row ${i + 1} date`), amountUsd: round2(num(r.amountUsd, 'amount')) };
+  });
+  // Ids are computed here from the row itself (prefixed "csv"), so imported rows can never take the
+  // place of statement rows, and importing the same file twice adds nothing.
+  const hashes = parsed.map((r) => sha256HexSync(txIdentity('csv', csvHashable(r), r.dup)));
+  const rows = parsed.map((r, i) => {
+    const match = /^\d{3}$/.test(r.account) ? core.accounts.find((a) => a.last3 === r.account) : core.accounts.find((a) => a.id === r.account);
     return {
-      h: hash,
-      a: match ? match.id : `csv:${account}`,
-      k: match ? match.bank : bankForLabel(account),
-      d: ymd(r.date, `Row ${i + 1} date`),
-      p: maskPayee(str(r.payee, 'payee', 300)),
-      u: round2(num(r.amountUsd, 'amount')),
-      c: category,
+      h: hashes[i],
+      a: match ? match.id : `csv:${r.account}`,
+      k: match ? match.bank : bankForLabel(r.account),
+      d: r.date,
+      p: maskPayee(r.payee),
+      u: r.amountUsd,
+      c: r.category,
     };
   });
   const stmts: D1PreparedStatement[] = [];
@@ -529,20 +650,20 @@ export async function getHistory(db: D1Database) {
   return { rows: r };
 }
 
-const EXPORT_TABLES: Record<string, string> = {
+const EXPORT_TABLES = new Map<string, string>(Object.entries({
   transactions: `SELECT date, time, account_id, source, payee, amount_orig, currency, amount_usd, balance, category, savings, is_cash, hash FROM transactions WHERE hash > ?1 ORDER BY hash LIMIT 1000`,
   logs: `SELECT date, created_at, kind, amount_usd, what, why, category, urgent, cash_tx_hash, id FROM logs WHERE id > ?1 ORDER BY id LIMIT 1000`,
   score_events: `SELECT week_start, at, creature_id, kind, delta, health_after, reason, printf('%012d', id) AS cursor FROM score_events WHERE printf('%012d', id) > ?1 ORDER BY id LIMIT 1000`,
   uploads: `SELECT uploaded_at, account_id, period_start, period_end, opening, closing, currency, row_count, new_rows, ok, baseline, id FROM uploads WHERE id > ?1 ORDER BY id LIMIT 1000`,
   creatures: `SELECT id, name, born_at, died_at, start_health, health, printf('%012d', id) AS cursor FROM creatures WHERE printf('%012d', id) > ?1 ORDER BY id LIMIT 1000`,
   payee_rules: `SELECT key, category, source, updated_at, key AS cursor FROM payee_rules WHERE key > ?1 ORDER BY key LIMIT 1000`,
-};
+}));
 
 /** Paged export (the browser builds the CSV, keeping Worker CPU low). The last column is the paging cursor. */
 export async function exportPage(db: D1Database, table: string, after: string) {
-  const sql = EXPORT_TABLES[table];
+  const sql = EXPORT_TABLES.get(table);
   if (!sql) throw bad('Unknown table.');
-  const stmt = db.prepare(sql).bind(after);
+  const stmt = db.prepare(sql).bind(after.slice(0, 200));
   const [columns, ...rows] = await stmt.raw({ columnNames: true });
   return { columns, rows, done: rows.length < 1000 };
 }

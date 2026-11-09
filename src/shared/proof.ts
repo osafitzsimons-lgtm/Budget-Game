@@ -64,7 +64,9 @@ export function checkProof(inp: ProofInput): ProofResult {
     });
   const firstGood = inp.firstGood;
 
+  let direction: ProofResult['direction'] = 'forward';
   if (!lastGood) {
+    direction = 'baseline';
     checks.push({
       id: 'baseline',
       ok: true,
@@ -74,9 +76,12 @@ export function checkProof(inp: ProofInput): ProofResult {
     });
   } else if (rows.length > 0 && newRows === 0) {
     // Uploaded before: nothing to add, nothing to check.
+    direction = 'duplicate';
     gapCheck(true, 'Every row in this statement is already saved. Nothing new will be added.');
   } else if (firstKnown === -1) {
-    if (firstGood && s.periodStart < firstGood.periodStart) {
+    const backfill = firstGood && (s.direction === 'backfill' ? s.periodStart <= firstGood.periodStart : s.periodStart < firstGood.periodStart);
+    if (firstGood && backfill) {
+      direction = 'backfill';
       // Fills in history before your earliest statement: its closing must be that statement's opening.
       const balOk = near(s.closing, firstGood.opening);
       const gapOk = s.periodEnd >= addDays(firstGood.periodStart, -1) || (!s.periodFromHeader && balOk);
@@ -96,6 +101,7 @@ export function checkProof(inp: ProofInput): ProofResult {
     }
   } else {
     // Overlaps what's saved. The saved rows must be one unbroken run, with new rows only before or after it.
+    direction = 'overlap';
     const interiorNew = known.slice(firstKnown, lastKnown + 1).some((k) => !k);
     if (interiorNew) {
       gapCheck(false, 'Some rows in the middle of this statement differ from what is already saved for the same dates. Stopped so nothing is counted twice or lost.');
@@ -116,5 +122,5 @@ export function checkProof(inp: ProofInput): ProofResult {
     }
   }
 
-  return { ok: checks.every((c) => c.ok || !c.blocking), covers: reaches, baseline: !lastGood, checks, newRows };
+  return { ok: checks.every((c) => c.ok || !c.blocking), covers: reaches, baseline: !lastGood, checks, newRows, firstKnown, lastKnown, direction };
 }

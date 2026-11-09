@@ -33,7 +33,9 @@ sw.addEventListener('fetch', (event: FetchEvent) => {
       (async () => {
         try {
           const res = await fetch(req);
-          if (res.ok && res.type === 'basic' && !res.redirected) {
+          // Only the app's own start page is kept for offline use (never Access sign-in/out pages).
+          const isAppShell = url.pathname === '/' || url.pathname === '/index.html';
+          if (isAppShell && res.ok && res.type === 'basic' && !res.redirected && (res.headers.get('Content-Type') ?? '').includes('text/html')) {
             const copy = res.clone();
             void caches.open(CACHE).then((c) => c.put('/', copy));
           }

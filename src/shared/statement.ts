@@ -1,6 +1,6 @@
 import type { ParsedStatement } from '../parsers/types';
 import { categorise, type CategoriseContext, type Categorised } from './categorise';
-import { hashRows } from './hash';
+import { dupIndexes, hashRows } from './hash';
 import { round2 } from './money';
 import { maskPayee } from './privacy';
 import type { Account, StatementSummary, TxRow } from './types';
@@ -28,10 +28,11 @@ export async function prepareStatement(parsed: ParsedStatement, accountId: strin
     const payee = maskPayee(r.description) || '(no description)';
     return { date: r.date, time: r.time, payee, amountOrig, amountUsd, balance: r.balance, seq: i };
   });
-  const hashes = await hashRows(accountId, base);
+  const dups = dupIndexes(accountId, base);
+  const hashes = await hashRows(accountId, base, dups);
   const rows: PreparedRow[] = base.map((b, i) => {
     const c = categorise(b.payee, b.amountUsd, ctx, parsed.accountLast3);
-    return { ...b, hash: hashes[i], currency: parsed.currency, category: c.category, savings: c.savings, isCash: c.isCash, reason: c.reason, needsReview: c.needsReview };
+    return { ...b, hash: hashes[i], dup: dups[i], currency: parsed.currency, category: c.category, savings: c.savings, isCash: c.isCash, reason: c.reason, needsReview: c.needsReview };
   });
   return {
     summary: {

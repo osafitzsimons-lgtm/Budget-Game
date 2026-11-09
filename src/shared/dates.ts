@@ -55,9 +55,14 @@ export function ppInstant(ymd: string, hour = 0, minute = 0): number {
   return guess - offsetAt(guess - offsetAt(guess));
 }
 
+const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
 export function isYmd(s: string): boolean {
-  return /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(ymdToUTC(s)) &&
-    new Date(ymdToUTC(s)).toISOString().slice(0, 10) === s;
+  if (typeof s !== 'string' || s.length !== 10 || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const y = +s.slice(0, 4), m = +s.slice(5, 7), d = +s.slice(8, 10);
+  if (m < 1 || m > 12 || d < 1) return false;
+  const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  return d <= (m === 2 && leap ? 29 : DAYS_IN_MONTH[m - 1]);
 }
 
 export function addDays(ymd: string, n: number): string {

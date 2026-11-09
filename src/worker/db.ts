@@ -1,7 +1,7 @@
 import { mergeSettings, type Settings } from '../shared/settings';
 import type { ScoredTx, UploadRecord } from '../shared/scoring';
 import type { LogEntry } from '../shared/types';
-import { SCHEMA } from './schema';
+import { MIGRATIONS, SCHEMA } from './schema';
 
 export interface DbAccount {
   id: string;
@@ -28,6 +28,15 @@ let schemaReady = false;
 export async function ensureSchema(db: D1Database): Promise<void> {
   if (schemaReady) return;
   await db.batch(SCHEMA.map((s) => db.prepare(s)));
+  if (MIGRATIONS.length) {
+    const row = await db.prepare(`SELECT value FROM meta WHERE key = 'schema_version'`).first<{ value: string }>();
+    let version = Number(row?.value ?? 1);
+    for (const m of MIGRATIONS.sort((a, b) => a.version - b.version)) {
+      if (m.version <= version) continue;
+      await db.batch([...m.statements.map((s) => db.prepare(s)), db.prepare(`UPDATE meta SET value = ?1 WHERE key = 'schema_version'`).bind(String(m.version))]);
+      version = m.version;
+    }
+  }
   schemaReady = true;
 }
 

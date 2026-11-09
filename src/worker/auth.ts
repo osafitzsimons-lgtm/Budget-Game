@@ -13,6 +13,8 @@ interface Jwk { kid: string; kty: string; n: string; e: string; alg?: string }
 
 let jwksCache: { team: string; keys: Map<string, CryptoKey>; fetchedAt: number } | null = null;
 const JWKS_TTL = 60 * 60 * 1000;
+/** Unknown key ids re-fetch the keys at most this often (stops a stream of junk tokens hammering Cloudflare). */
+const REFETCH_MIN_GAP = 60 * 1000;
 
 export function _resetJwksCache() {
   jwksCache = null;
@@ -64,27 +66,32 @@ export async function verifyAccess(req: Request, env: AuthEnv, fetcher: typeof f
   const parts = token.split('.');
   if (parts.length !== 3) return { ok: false, status: 401, error: 'Malformed Access token.' };
 
-  let header: { alg?: string; kid?: string };
-  let payload: { iss?: string; aud?: string | string[]; exp?: number; nbf?: number; email?: string; type?: string };
+  let header: { alg?: unknown; kid?: unknown };
+  let payload: { iss?: unknown; aud?: unknown; exp?: unknown; nbf?: unknown; email?: unknown };
+  let signature: Uint8Array<ArrayBuffer>;
   try {
     header = JSON.parse(new TextDecoder().decode(b64urlDecode(parts[0])));
     payload = JSON.parse(new TextDecoder().decode(b64urlDecode(parts[1])));
+    signature = b64urlDecode(parts[2]);
   } catch {
     return { ok: false, status: 401, error: 'Malformed Access token.' };
   }
-  if (header.alg !== 'RS256' || !header.kid) return { ok: false, status: 401, error: 'Unsupported Access token.' };
+  if (!header || typeof header !== 'object' || !payload || typeof payload !== 'object') return { ok: false, status: 401, error: 'Malformed Access token.' };
+  if (header.alg !== 'RS256' || typeof header.kid !== 'string' || !header.kid) return { ok: false, status: 401, error: 'Unsupported Access token.' };
+  const kid = header.kid;
 
   let keys: Map<string, CryptoKey>;
   try {
     keys = await getKeys(team, false, fetcher);
-    if (!keys.has(header.kid)) keys = await getKeys(team, true, fetcher); // keys rotate
+    // Keys rotate: re-fetch for an unknown key id, but not more than once a minute.
+    if (!keys.has(kid) && jwksCache && Date.now() - jwksCache.fetchedAt > REFETCH_MIN_GAP) keys = await getKeys(team, true, fetcher);
   } catch {
     return { ok: false, status: 503, error: 'Could not fetch Cloudflare Access keys.' };
   }
-  const key = keys.get(header.kid);
+  const key = keys.get(kid);
   if (!key) return { ok: false, status: 401, error: 'Unknown Access signing key.' };
 
-  const valid = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, b64urlDecode(parts[2]), new TextEncoder().encode(`${parts[0]}.${parts[1]}`));
+  const valid = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, signature, new TextEncoder().encode(`${parts[0]}.${parts[1]}`));
   if (!valid) return { ok: false, status: 401, error: 'Invalid Access token signature.' };
 
   const now = Math.floor(Date.now() / 1000);
@@ -93,6 +100,6 @@ export async function verifyAccess(req: Request, env: AuthEnv, fetcher: typeof f
   if (!tokenAuds.some((a) => auds.includes(a))) return { ok: false, status: 401, error: 'Access token for a different application.' };
   if (typeof payload.exp !== 'number' || payload.exp < now - 30) return { ok: false, status: 401, error: 'Access token expired. Reload the page.' };
   if (typeof payload.nbf === 'number' && payload.nbf > now + 30) return { ok: false, status: 401, error: 'Access token not valid yet.' };
-  if (!payload.email || payload.email.trim().toLowerCase() !== allowed) return { ok: false, status: 403, error: 'This account is not allowed.' };
+  if (typeof payload.email !== 'string' || payload.email.trim().toLowerCase() !== allowed) return { ok: false, status: 403, error: 'This account is not allowed.' };
   return { ok: true, email: payload.email };
 }

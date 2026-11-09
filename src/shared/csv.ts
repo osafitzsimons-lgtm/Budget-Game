@@ -1,5 +1,6 @@
 import { isCategory } from './categories';
 import { isYmd } from './dates';
+import { maskPayee } from './privacy';
 
 export function parseCsv(text: string): string[][] {
   const rows: string[][] = [];
@@ -29,8 +30,9 @@ export function parseCsv(text: string): string[][] {
 
 export function csvEscape(v: unknown): string {
   const s = v === null || v === undefined ? '' : String(v);
-  // Guard against spreadsheet formula injection.
-  const safe = /^[=+\-@\t\r]/.test(s) && !/^-?\d/.test(s) ? `'${s}` : s;
+  // Guard against spreadsheet formula injection: anything starting like a formula gets a leading
+  // apostrophe, except plain numbers such as -12.50.
+  const safe = /^[=+\-@\t\r]/.test(s) && !/^-?\d+(\.\d+)?$/.test(s) ? `'${s}` : s;
   return /[",\n\r]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
 }
 
@@ -69,3 +71,11 @@ export function parseHistoryCsv(text: string): { rows: HistoryCsvRow[]; errors: 
   });
   return { rows, errors };
 }
+
+/** What identifies an imported history row (the server hashes this; re-importing the same file adds nothing). */
+export function csvHashable(r: { date: string; account: string; payee: string; amountUsd: number }) {
+  return { date: r.date, time: null, payee: `${r.account.trim()}|${maskPayee(r.payee)}`, amountOrig: r.amountUsd, balance: null };
+}
+
+/** Rows per import request (keeps each request well under the free plan's CPU limit). */
+export const CSV_ROWS_PER_REQUEST = 500;

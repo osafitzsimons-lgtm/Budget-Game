@@ -15,22 +15,30 @@ const SEP = '\\s.\\-\\u2010-\\u2015/_';
 /** A run of digits, separators and hiding characters (X, *, •). Matches greedily with no backtracking. */
 const RUN = new RegExp(`[0-9Xx*•][0-9Xx*•${SEP}]*`, 'g');
 
+const NON_ASCII = /[^\x00-\x7F]/;
+
 function normalise(raw: string): string {
-  return raw
-    .slice(0, MAX_LEN * 4)
-    .normalize('NFKC')
-    .replace(INVISIBLE, '')
-    .replace(KHMER, (d) => String(d.charCodeAt(0) - 0x17e0))
-    .replace(/\s+/g, ' ')
-    .trim();
+  let s = raw.slice(0, MAX_LEN * 4);
+  if (NON_ASCII.test(s)) s = s.normalize('NFKC').replace(INVISIBLE, '').replace(KHMER, (d) => String(d.charCodeAt(0) - 0x17e0));
+  return s.replace(/\s+/g, ' ').trim();
 }
 
 function maskRun(run: string): string {
-  // Leave trailing separators alone (e.g. "1234 - " before more text).
-  const core = run.replace(new RegExp(`[${SEP}]+$`), '');
-  const tail = run.slice(core.length);
+  // Cheap first pass: count digits and hiding characters in one go.
+  let digitCount = 0;
+  let hidden = 0;
+  for (let i = 0; i < run.length; i++) {
+    const c = run.charCodeAt(i);
+    if (c >= 48 && c <= 57) digitCount++;
+    else if (c === 88 || c === 120 || c === 42 || c === 0x2022) hidden++;
+  }
+  if (digitCount < 3) return run;
+  // Leave trailing separators alone (e.g. "1234 - " before more text). Scanned by hand: linear time.
+  let end = run.length;
+  while (end > 0 && !/[0-9Xx*•]/.test(run[end - 1])) end--;
+  const core = run.slice(0, end);
+  const tail = run.slice(end);
   const digits = core.replace(/\D/g, '');
-  const hidden = (core.match(/[Xx*•]/g) ?? []).length;
   const contiguous = /\d{6,}/.test(core);
   const separated = digits.length >= 8;
   // Card numbers with hidden digits (412345******1234, XXXX XXXX XXXX 1234), long digit runs, or
