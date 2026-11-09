@@ -54,7 +54,7 @@ export async function verifyAccess(req: Request, env: AuthEnv, fetcher: typeof f
   const audRaw = env.POLICY_AUD?.trim();
   const allowed = env.ALLOWED_EMAIL?.trim().toLowerCase();
   if (!teamRaw || !audRaw || !allowed) {
-    return { ok: false, status: 503, error: 'Server is missing TEAM_DOMAIN, POLICY_AUD or ALLOWED_EMAIL, so all requests are refused. See SETUP.md step 6.' };
+    return { ok: false, status: 503, error: 'Server is missing TEAM_DOMAIN, POLICY_AUD or ALLOWED_EMAIL, so all requests are refused. See SETUP.md step 2.' };
   }
   const team = normaliseTeam(teamRaw);
   const auds = audRaw.split(',').map((a) => a.trim()).filter(Boolean);

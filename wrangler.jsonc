@@ -1,7 +1,8 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  // Must match the Worker name in the Cloudflare dashboard (Workers Builds checks this).
-  "name": "budget-guy",
+  // Must match the Worker's name in the Cloudflare dashboard. Yours was created as "budget-game"
+  // (named after the repository), so the config uses that and Cloudflare deploys without warnings.
+  "name": "budget-game",
   "main": "./src/worker/index.ts",
   "compatibility_date": "2026-11-09",
   // Keep variables/secrets you set in the dashboard when Workers Builds redeploys.
@@ -19,12 +20,11 @@
     // Only /api/* runs Worker code. Everything else is a free static-asset request.
     "run_worker_first": ["/api/*"]
   },
+  // No database ID needed: on the first deploy Cloudflare creates the database (named
+  // "budget-game-db") and keeps it attached on every later deploy. The app creates its own tables.
   "d1_databases": [
     {
-      "binding": "DB",
-      "database_name": "budget-guy-db",
-      // SETUP.md step 3: replace this with the Database ID shown in the Cloudflare dashboard.
-      "database_id": "REPLACE-WITH-YOUR-D1-DATABASE-ID"
+      "binding": "DB"
     }
   ],
   // Branch previews get NO database and no secrets, so a preview can never read or
