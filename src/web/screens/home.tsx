@@ -15,6 +15,14 @@ function countdown(ms: number): string {
   return `${mm}m`;
 }
 
+/** What he says about this week's money, so overspending is felt before Sunday. */
+function weekWorry(left: number, allowance: number): string | undefined {
+  if (left < -0.4 * allowance) return `We’re ${usd(-left)} over this week. Sunday is going to really hurt me…`;
+  if (left < 0) return `We’re ${usd(-left)} over this week. Please stop — I’ll feel it on Sunday.`;
+  if (left < 0.2 * allowance) return `Only ${usd(left)} left this week. Careful…`;
+  return undefined;
+}
+
 export function Home({ state, go }: ScreenProps) {
   const [now, setNow] = useState(Date.now());
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(t); }, []);
@@ -31,7 +39,7 @@ export function Home({ state, go }: ScreenProps) {
   return (
     <div>
       <div class="card">
-        <CreatureView name={s.creature.name} before={ls ? ls.before : s.creature.health} after={s.creature.health} died={ls?.died} />
+        <CreatureView name={s.creature.name} before={ls ? ls.before : s.creature.health} after={s.creature.health} died={ls?.died} say={weekWorry(left, s.week.allowance)} />
         {ls && ls.events.length > 0 && (
           <div class="notice warn" style={{ marginTop: 12 }}>
             <strong>While you were away</strong>
@@ -39,6 +47,18 @@ export function Home({ state, go }: ScreenProps) {
           </div>
         )}
       </div>
+
+      {s.awaitingLate.length > 0 && (
+        <div class="notice bad">
+          <strong>Missed {s.awaitingLate.length === 1 ? 'week' : 'weeks'} — upload late to get {s.awaitingLate.length === 1 ? 'it' : 'them'} scored</strong>
+          <ul class="plain">
+            {s.awaitingLate.map((w) => (
+              <li>{formatDate(w.weekStart)} – {formatDate(w.weekEnd)}: still need {w.needed.map((id) => s.accounts.find((a) => a.id === id)?.label ?? id).join(', ')}</li>
+            ))}
+          </ul>
+          <small>The −25 stays, but the week's spending is scored once its statements are in.</small>
+        </div>
+      )}
 
       {deathNotice && (
         <div class="notice bad">
@@ -60,10 +80,10 @@ export function Home({ state, go }: ScreenProps) {
         </div>
         <Progress value={s.week.spent + s.week.pending} max={s.week.allowance} />
         <p class="muted">
-          Spent <Money n={s.week.spent} /> in uploaded statements{s.week.pending > 0 && <> + <Money n={s.week.pending} /> written down</>}.
+          Spent <Money n={s.week.spent} /> so far (statements and anything added by hand){s.week.pending > 0 && <> + <Money n={s.week.pending} /> written down</>}.
         </p>
         {s.week.unloggedSoFar.length > 0 && (
-          <p class="bad">{s.week.unloggedSoFar.length} spend{s.week.unloggedSoFar.length > 1 ? 's' : ''} of $30+ weren't written down first (−5 each at the deadline).</p>
+          <p class="bad">{s.week.unloggedSoFar.length === 1 ? '1 spend of $30+ wasn’t' : `${s.week.unloggedSoFar.length} spends of $30+ weren’t`} written down first (−5 each at the deadline).</p>
         )}
       </div>
 

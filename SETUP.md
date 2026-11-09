@@ -136,7 +136,7 @@ The first time you open it, the app creates its own database tables. That is the
 2. **Settings → Import history (CSV):** choose `budget_guy_seed_transactions.csv`. This teaches payee rules and fills History. It never changes health.
 3. **Upload:** pick this week's ABA 812, ABA 013 and Revolut 554 PDFs (and ABA 811 if you like). The first upload for each account sets its starting balance.
 
-Every week after that, upload all statements by **Sunday 8pm** (Phnom Penh time).
+Every week after that, upload all statements by **Sunday 8pm** (Phnom Penh time). If you miss it, upload anyway: the −25 stays, but the week is still scored once its statements are in. Spending that won't be on any statement (for example a friend paid on their card) can be added by hand on the Upload screen.
 
 ---
 

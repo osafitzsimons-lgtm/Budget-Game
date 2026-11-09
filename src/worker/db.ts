@@ -101,6 +101,8 @@ export interface Core {
   accounts: DbAccount[];
   uploads: ReturnType<typeof rowToUpload>[];
   evaluated: Set<string>;
+  /** weeks that took a missing/failing penalty and still wait for late statements */
+  awaitingLate: Set<string>;
   creature: DbCreature;
   creatures: DbCreature[];
 }
@@ -111,7 +113,7 @@ export async function loadCore(db: D1Database, now: number, todayWeekStart: stri
     db.prepare(`SELECT value FROM meta WHERE key = 'settings'`),
     db.prepare(`SELECT * FROM accounts ORDER BY sort, id`),
     db.prepare(`SELECT * FROM uploads ORDER BY uploaded_at`),
-    db.prepare(`SELECT week_start FROM week_evals`),
+    db.prepare(`SELECT w.week_start, w.data_ok, (SELECT 1 FROM late_evals l WHERE l.week_start = w.week_start) AS late FROM week_evals w`),
     db.prepare(`SELECT * FROM creatures ORDER BY id`),
   ]);
   const stored = (s.results[0] as Row | undefined)?.value;
@@ -133,6 +135,7 @@ export async function loadCore(db: D1Database, now: number, todayWeekStart: stri
     accounts: (a.results as Row[]).map(rowToAccount),
     uploads: (u.results as Row[]).map(rowToUpload),
     evaluated: new Set((w.results as Row[]).map((r) => String(r.week_start))),
+    awaitingLate: new Set((w.results as Row[]).filter((r) => !r.data_ok && !r.late).map((r) => String(r.week_start))),
     creature: alive[alive.length - 1] ?? creatures[creatures.length - 1],
     creatures,
   };

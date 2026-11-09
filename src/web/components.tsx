@@ -34,7 +34,7 @@ export function HealthBar({ health }: { health: number }) {
 }
 
 /** Creature with an animated health change (e.g. after an upload). */
-export function CreatureView({ name, before, after, died }: { name: string; before: number; after: number; died?: boolean }) {
+export function CreatureView({ name, before, after, died, say }: { name: string; before: number; after: number; died?: boolean; say?: string }) {
   // If he died, animate down to 0 first, then show the new sprout.
   const target = died ? 0 : after;
   const shown = useAnimatedNumber(before, target);
@@ -54,7 +54,7 @@ export function CreatureView({ name, before, after, died }: { name: string; befo
       <div class="health">{name}: <span class="num">{h}</span>/100</div>
       <HealthBar health={h} />
       <p class="muted">{lineFor(look, name)}</p>
-      <div class="speech" aria-live="polite">“{speechFor(look)}”</div>
+      <div class="speech" aria-live="polite">“{look !== 'dead' && say ? say : speechFor(look)}”</div>
     </div>
   );
 }

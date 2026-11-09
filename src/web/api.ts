@@ -22,6 +22,8 @@ export interface AppState {
   rules: [string, string][];
   logs: LogEntry[];
   cash: { hash: string; date: string; payee: string; amountUsd: number; accountId: string; logged: number }[];
+  manual: { hash: string; date: string; payee: string; amountUsd: number; category: string; savings: boolean; createdAt: number }[];
+  awaitingLate: { weekStart: string; weekEnd: string; needed: string[] }[];
   lastScoring: { before: number; after: number; events: Omit<ScoreEventView, 'id'>[]; died: boolean } | null;
 }
 
@@ -70,6 +72,8 @@ export const api = {
   confirm: (statement: unknown, rows: unknown, rules: unknown) => request<ConfirmResult>('POST', '/api/uploads/confirm', { statement, rows, rules }),
   addLog: (log: Record<string, unknown>) => request<{ id: string }>('POST', '/api/logs', log),
   deleteLog: (id: string) => request<{ ok: true }>('DELETE', `/api/logs/${encodeURIComponent(id)}`),
+  addManual: (t: Record<string, unknown>) => request<{ hash: string; note: string | null }>('POST', '/api/transactions', t),
+  deleteManual: (hash: string) => request<{ ok: true }>('DELETE', `/api/transactions/${encodeURIComponent(hash)}`),
   saveSettings: (settings: Settings) => request<{ settings: Settings }>('POST', '/api/settings', { settings }),
   saveAccount: (a: Record<string, unknown>) => request<{ id: string }>('POST', '/api/accounts', a),
   importCsv: (rows: unknown[]) => request<{ inserted: number; skipped: number; rulesLearned: number }>('POST', '/api/import-csv', { rows }),

@@ -39,12 +39,17 @@ export interface StatementSummary {
 export interface ProofCheck {
   id: 'account' | 'reaches-saturday' | 'no-gap' | 'opening-balance' | 'baseline';
   ok: boolean;
+  /** false = informational: the statement is still saved if this fails (it just doesn't cover last week yet) */
+  blocking: boolean;
   label: string;
   detail: string;
 }
 
 export interface ProofResult {
+  /** every blocking check passed: the rows are saved */
   ok: boolean;
+  /** reaches last Saturday */
+  covers: boolean;
   baseline: boolean;
   checks: ProofCheck[];
   newRows: number;

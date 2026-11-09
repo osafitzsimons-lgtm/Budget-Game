@@ -1,17 +1,20 @@
-// Works out missed deadlines whenever the app is opened (no cron jobs), and scores
-// a finished week early once every required statement is in.
+// Works out missed deadlines whenever the app is opened (no cron jobs), scores a finished
+// week early once every required statement is in, and scores missed weeks when their
+// statements arrive late.
 import { addDays, ppDate, weekDeadline, weekEnd } from '../shared/dates';
 import {
+  allStatementsIn,
   applyEvents,
   canEvaluateEarly,
+  DEATH_SAVINGS_PENALTY,
   dueWeeks,
+  type EvalMode,
   evaluateWeek,
   penaltyMonth,
   REBIRTH_HEALTH,
   savedInWindow,
   savingsMonthForWeek,
   savingsWindow,
-  DEATH_SAVINGS_PENALTY,
   type ScoredTx,
   type UploadRecord,
 } from '../shared/scoring';
@@ -26,6 +29,7 @@ export interface EvalContext {
   accounts: DbAccount[];
   uploads: UploadRecord[];
   evaluated: Set<string>;
+  awaitingLate: Set<string>;
   creature: DbCreature;
   deaths: { diedAt: number }[];
 }
@@ -38,33 +42,52 @@ export interface EvalOutcome {
   died: boolean;
 }
 
-/** Weeks that can be scored now: deadline passed, or (early) the week is over and every statement is in. */
-export function weeksToScore(ctx: Pick<EvalContext, 'now' | 'settings' | 'accounts' | 'uploads' | 'evaluated'>): { week: string; early: boolean }[] {
-  const out = dueWeeks(ctx.settings.scoringStart, ctx.now, ctx.evaluated).map((w) => ({ week: w, early: false }));
-  if (!ctx.settings.scoringStart) return out;
-  const required = ctx.accounts.filter((a) => a.active && !a.optional).map((a) => a.id);
+/**
+ * Transactions that count for scoring: statement rows, plus spending added by hand. Hand-added money in
+ * never offsets spending (there's no proof of it), and the CSV history never counts.
+ */
+export const SCORED_SOURCES = `(source = 'pdf' OR (source = 'manual' AND amount_usd > 0))`;
+
+export function requiredIds(accounts: DbAccount[]): string[] {
+  return accounts.filter((a) => a.active && !a.optional).map((a) => a.id);
+}
+
+/** Weeks that can be scored now, oldest first. */
+export function weeksToScore(ctx: Pick<EvalContext, 'now' | 'settings' | 'accounts' | 'uploads' | 'evaluated' | 'awaitingLate'>): { week: string; mode: EvalMode }[] {
+  if (!ctx.settings.scoringStart) return [];
+  const required = requiredIds(ctx.accounts);
+  const out: { week: string; mode: EvalMode }[] = [];
+  // Missed weeks whose statements have now arrived.
+  for (const w of [...ctx.awaitingLate].sort()) if (allStatementsIn(w, ctx.now, required, ctx.uploads, ctx.settings.scoringStart)) out.push({ week: w, mode: 'late' });
+  for (const w of dueWeeks(ctx.settings.scoringStart, ctx.now, ctx.evaluated)) out.push({ week: w, mode: 'deadline' });
   // The most recent finished week whose deadline hasn't passed yet.
   let w = ctx.settings.scoringStart;
   while (weekDeadline(w) <= ctx.now) w = addDays(w, 7);
-  if (!ctx.evaluated.has(w) && !out.some((x) => x.week === w) && canEvaluateEarly(w, ctx.now, required, ctx.uploads)) out.push({ week: w, early: true });
-  return out;
+  if (!ctx.evaluated.has(w) && canEvaluateEarly(w, ctx.now, required, ctx.uploads, ctx.settings.scoringStart)) out.push({ week: w, mode: 'early' });
+  // In the order they happen: deadline penalties at their deadlines, then early/late scores "now".
+  const at = (x: { week: string; mode: EvalMode }) => (x.mode === 'deadline' ? weekDeadline(x.week) : ctx.now);
+  return out.sort((a, b) => at(a) - at(b) || (a.week < b.week ? -1 : a.week > b.week ? 1 : 0));
 }
 
 export async function scoreDueWeeks(ctx: EvalContext): Promise<EvalOutcome | null> {
   const todo = weeksToScore(ctx);
   if (!todo.length) return null;
   const { db, settings } = ctx;
-  const required = ctx.accounts.filter((a) => a.active && !a.optional).map((a) => a.id);
-  const first = todo[0].week;
-  const last = weekEnd(todo[todo.length - 1].week);
+  const required = requiredIds(ctx.accounts);
+  const weeks = todo.map((t) => t.week).sort();
+  const first = weeks[0];
+  const last = weekEnd(weeks[weeks.length - 1]);
   const savingsFrom = addDays(first, -45);
 
-  const [txRes, logRes] = await db.batch([
-    db.prepare(`SELECT * FROM transactions WHERE source = 'pdf' AND date >= ?1 AND date <= ?2`).bind(savingsFrom, last),
+  const lateWeeks = todo.filter((t) => t.mode === 'late').map((t) => t.week);
+  const [txRes, logRes, savRes] = await db.batch([
+    db.prepare(`SELECT * FROM transactions WHERE ${SCORED_SOURCES} AND date >= ?1 AND date <= ?2`).bind(savingsFrom, last),
     db.prepare(`SELECT * FROM logs WHERE date >= ?1`).bind(addDays(first, -2)),
+    db.prepare(`SELECT week_start, SUM(delta) AS d FROM score_events WHERE kind = 'savings' AND week_start IN (SELECT value FROM json_each(?1)) GROUP BY week_start`).bind(JSON.stringify(lateWeeks)),
   ]);
   const txs: ScoredTx[] = (txRes.results as Record<string, unknown>[]).map(rowToTx);
   const logs: LogEntry[] = (logRes.results as Record<string, unknown>[]).map(rowToLog);
+  const savingsGiven = new Map((savRes.results as { week_start: string; d: number }[]).map((r) => [r.week_start, Number(r.d)]));
   const savingsTracked = !!settings.savingsAccountId && ctx.uploads.some((u) => u.accountId === settings.savingsAccountId && u.ok);
 
   let health = ctx.creature.health;
@@ -75,36 +98,42 @@ export async function scoreDueWeeks(ctx: EvalContext): Promise<EvalOutcome | nul
   const stmts: D1PreparedStatement[] = [];
   let died = false;
 
-  for (const { week, early } of todo) {
-    const at = early ? ctx.now : weekDeadline(week);
+  for (const { week, mode } of todo) {
+    const at = mode === 'deadline' ? weekDeadline(week) : ctx.now;
     const end = weekEnd(week);
-    // Logs for the -5 rule must have been written before the deadline/evaluation.
-    const logsAtTime = logs.filter((l) => l.createdAt <= at);
+    // "Write it down" entries count only if written before the deadline (or before an early score).
+    const logCutoff = mode === 'late' ? weekDeadline(week) : at;
+    const logsAtTime = logs.filter((l) => l.createdAt <= logCutoff);
     let savings: { month: string; saved: number; target: number } | null = null;
     const month = savingsMonthForWeek(week);
     if (month && `${month}-03` >= settings.scoringStart) {
       const win = savingsWindow(month, settings.savingsWindowStartDay);
-      const extra = deaths.filter((d) => penaltyMonth(ppDate(d.diedAt)) === month).length * DEATH_SAVINGS_PENALTY;
+      const extra = deaths.filter((d) => penaltyMonth(ppDate(d.diedAt)) === month && d.diedAt < at).length * DEATH_SAVINGS_PENALTY;
       savings = {
         month,
         saved: savedInWindow(txs, win.from, win.to, settings.savingsAccountId, savingsTracked),
         target: phaseValue(settings.savingsTarget, `${month}-01`) + extra,
       };
     }
-    const raw = evaluateWeek({
+    const result = evaluateWeek({
       weekStart: week,
       atMs: at,
-      early,
+      mode,
       requiredAccountIds: required,
       uploads: ctx.uploads,
       weekTxs: txs.filter((t) => t.date >= week && t.date <= end),
       logs: logsAtTime,
       settings,
       savings,
+      savingsPenaltyAtDeadline: savingsGiven.get(week),
     });
-    const applied = applyEvents(raw, health, creatureId, week, at, settings.halveNegativesBefore);
+    const applied = applyEvents(result.events, health, creatureId, week, at, settings.halveNegativesBefore, mode === 'late' ? weekDeadline(week) : at);
     events.push(...applied.events);
-    stmts.push(db.prepare(`INSERT INTO week_evals (week_start, evaluated_at, early) VALUES (?1, ?2, ?3)`).bind(week, ctx.now, early ? 1 : 0));
+    if (mode === 'late') {
+      stmts.push(db.prepare(`INSERT INTO late_evals (week_start, evaluated_at) VALUES (?1, ?2)`).bind(week, ctx.now));
+    } else {
+      stmts.push(db.prepare(`INSERT INTO week_evals (week_start, evaluated_at, early, data_ok) VALUES (?1, ?2, ?3, ?4)`).bind(week, ctx.now, mode === 'early' ? 1 : 0, result.dataOk ? 1 : 0));
+    }
     if (applied.died) {
       died = true;
       deaths.push({ diedAt: at });

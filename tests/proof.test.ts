@@ -27,10 +27,20 @@ describe('proof checks', () => {
   it('wrong account fails', () => {
     expect(checkProof(base({ accountOk: false })).ok).toBe(false);
   });
-  it('must reach the previous Saturday', () => {
+  it('a statement that stops before last Saturday is still saved (late uploads), but does not cover the week', () => {
     const r = checkProof(base({ statement: { ...base().statement, periodEnd: '2026-11-13' } }));
-    expect(byId(r, 'reaches-saturday').ok).toBe(false);
-    expect(r.ok).toBe(false);
+    expect(byId(r, 'reaches-saturday')).toMatchObject({ ok: false, blocking: false });
+    expect(r.ok).toBe(true);
+    expect(r.covers).toBe(false);
+  });
+  it('re-uploading an older statement whose rows are all saved is accepted and adds nothing', () => {
+    const r = checkProof(base({
+      statement: { ...base().statement, periodStart: '2026-10-25', periodEnd: '2026-10-31', opening: 300, closing: 250 },
+      rows: [{ hash: 'x', balance: 250 }],
+      knownHashes: new Set(['x']),
+    }));
+    expect(r.ok).toBe(true);
+    expect(r.newRows).toBe(0);
   });
   it('a gap since the last upload fails', () => {
     const r = checkProof(base({ statement: { ...base().statement, periodStart: '2026-11-10' } }));
@@ -54,5 +64,62 @@ describe('proof checks', () => {
     const st = { ...base().statement, periodStart: '2026-11-10', periodFromHeader: false };
     expect(checkProof(base({ statement: st })).ok).toBe(true);
     expect(checkProof(base({ statement: { ...st, opening: 99 } })).ok).toBe(false);
+  });
+
+  describe('filling in history before the first statement', () => {
+    const first = { periodStart: '2026-11-01', opening: 100 };
+    const last = { periodEnd: '2026-11-14', closing: 80 };
+    it('an older statement whose closing is the earliest opening is accepted', () => {
+      const r = checkProof(base({
+        lastGood: last, firstGood: first,
+        statement: { ...base().statement, periodStart: '2026-10-01', periodEnd: '2026-10-31', opening: 300, closing: 100 },
+        rows: [{ hash: 'o1', balance: 200 }, { hash: 'o2', balance: 100 }],
+      }));
+      expect(r.ok).toBe(true);
+      expect(r.newRows).toBe(2);
+    });
+    it('an older statement that does not join up is refused', () => {
+      const r = checkProof(base({
+        lastGood: last, firstGood: first,
+        statement: { ...base().statement, periodStart: '2026-10-01', periodEnd: '2026-10-31', opening: 300, closing: 101 },
+        rows: [{ hash: 'o1', balance: 200 }, { hash: 'o2', balance: 101 }],
+      }));
+      expect(r.ok).toBe(false);
+    });
+    it('an older statement with a gap before the earliest one is refused', () => {
+      const r = checkProof(base({
+        lastGood: last, firstGood: first,
+        statement: { ...base().statement, periodStart: '2026-10-01', periodEnd: '2026-10-20', opening: 300, closing: 100 },
+        rows: [{ hash: 'o1', balance: 100 }],
+      }));
+      expect(byId(r, 'no-gap').ok).toBe(false);
+    });
+    it('one big statement spanning older history, saved rows and newer rows is accepted', () => {
+      const r = checkProof(base({
+        lastGood: last, firstGood: first,
+        statement: { ...base().statement, periodStart: '2026-10-01', periodEnd: '2026-11-21', opening: 300, closing: 70 },
+        rows: [{ hash: 'o1', balance: 100 }, { hash: 'a', balance: 90 }, { hash: 'b', balance: 80 }, { hash: 'n1', balance: 70 }],
+        knownHashes: new Set(['a', 'b']),
+      }));
+      expect(r.ok).toBe(true);
+      expect(r.newRows).toBe(2);
+    });
+    it('new rows in the middle of saved ones (statement differs from what is saved) are refused', () => {
+      const r = checkProof(base({
+        lastGood: last, firstGood: first,
+        rows: [{ hash: 'a', balance: 90 }, { hash: 'x', balance: 85 }, { hash: 'b', balance: 80 }],
+        knownHashes: new Set(['a', 'b']),
+      }));
+      expect(r.ok).toBe(false);
+    });
+    it('new rows before saved ones are refused when the statement does not start before the earliest', () => {
+      const r = checkProof(base({
+        lastGood: last, firstGood: { periodStart: '2026-10-01', opening: 500 },
+        statement: { ...base().statement, periodStart: '2026-11-05' },
+        rows: [{ hash: 'x', balance: 95 }, { hash: 'a', balance: 90 }],
+        knownHashes: new Set(['a']),
+      }));
+      expect(r.ok).toBe(false);
+    });
   });
 });

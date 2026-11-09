@@ -31,8 +31,13 @@ At 0 he dies and goes in the graveyard. The app shows "$25 extra to savings next
 
 ### Decisions where the brief left room
 
-- **Missing or failing week:** you get only the −25, with no spending score. A late upload doesn't reopen a closed week.
-- **Failing statements:** a statement that fails the proof check is recorded as an attempt, but its rows are not saved. Upload a statement that covers the gap to fix it before the deadline.
+- **Missed deadline, then a late upload:** the −25 is given at Sunday 8pm. Once the late statements for every required account are in, the week gets its normal spending score and −5s. These keep the grace-period halving if the week was before 29 Nov. If late statements prove savings were moved by the 3rd, the −30 savings penalty is refunded (no +10 bonus). Missed weeks waiting for statements are listed on Home.
+- **Failing statements:** a statement whose balances don't join up, or that leaves a gap, is recorded as an attempt but its rows are not saved. Upload one that fixes it, even after the deadline.
+- **"Reaches last Saturday"** is checked but doesn't block saving. An older statement is still saved if its balances join up; the week just isn't covered until a statement reaching Saturday is in.
+- **Older history:** a statement from before your first upload is accepted if its closing balance is your earliest statement's opening balance. So you can add the big Aug–Oct PDF after a newer one, or one statement spanning both.
+- **A week counts as covered** when an account's statements start on or before that week's Sunday and reach its Saturday. The first scored week is exempt, because the first statement only sets the baseline.
+- **Transactions added by hand** (Upload → "Add a transaction by hand") are for spending that won't be on any uploaded statement. Spending counts towards the week, including the −5 rule. Money in added by hand shows in History but never reduces spending, and hand-added rows never count as savings, because only statements prove those. They can be deleted within 24 hours.
+- **No required accounts:** if every account is made optional, each week gets −25 rather than a free +15.
 - **"Previous Saturday":** the most recent Saturday before today. On a Sunday that is yesterday.
 - **Built-in rules come before remembered payees** for Grab, TADA under $5, and cash withdrawals. Your history labels "Grab" both ways and cash withdrawals as Transfer, which would otherwise override the amount and cash rules.
 - **TADA $5 or more** has no rule, so it uses the remembered payee, or Unidentified if there isn't one.

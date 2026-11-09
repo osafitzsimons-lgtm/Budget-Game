@@ -6,7 +6,7 @@ import { usd } from '../../shared/money';
 import { contextFrom, findAccount, prepareStatement, type PreparedStatement } from '../../shared/statement';
 import type { ProofResult } from '../../shared/types';
 import type { ParsedStatement } from '../../parsers/index';
-import { api, type ConfirmResult } from '../api';
+import { api, type AppState, type ConfirmResult } from '../api';
 import type { ScreenProps } from '../app';
 import { CreatureView, EventList } from '../components';
 import { parsePdfFile } from '../pdf';
@@ -124,16 +124,21 @@ export function Upload({ state, reload }: ScreenProps) {
       )}
       <div class="card">
         <p>Pick this week's PDF statements (ABA and Revolut). They are read on this phone and never uploaded — only the transaction rows are saved.</p>
+        <p class="muted">Missed a Sunday? Upload anyway: the missed week gets scored once its statements are in. Older statements can be added too, as long as their balances join up.</p>
         <label for="pdfs">Statement PDFs</label>
         <input id="pdfs" type="file" accept="application/pdf,.pdf" multiple onChange={(e) => { void onFiles((e.target as HTMLInputElement).files); (e.target as HTMLInputElement).value = ''; }} />
       </div>
-      {items.map((it) => <StatementCard it={it} onCategory={setCategory} onSavings={setSavings} onReviewed={toggleReviewed} onConfirm={confirm} onToggleAll={() => update(it.key, (x) => ({ ...x, showAll: !x.showAll }))} onRemove={() => setItems((xs) => xs.filter((x) => x.key !== it.key))} />)}
+      <ManualEntry state={state} reload={reload} />
+      {items.map((it) => <StatementCard it={it} blockedBy={items.find((o) => o !== it && o.status !== 'done' && o.status !== 'error' && o.prep && it.prep && o.prep.summary.accountId === it.prep.summary.accountId && o.prep.summary.periodStart < it.prep.summary.periodStart)?.fileName} manual={state.manual} onCategory={setCategory} onSavings={setSavings} onReviewed={toggleReviewed} onConfirm={confirm} onToggleAll={() => update(it.key, (x) => ({ ...x, showAll: !x.showAll }))} onRemove={() => setItems((xs) => xs.filter((x) => x.key !== it.key))} />)}
     </div>
   );
 }
 
 interface CardProps {
   it: Item;
+  /** an older statement for the same account that must be confirmed first */
+  blockedBy?: string;
+  manual: AppState['manual'];
   onCategory: (it: Item, idx: number, c: string) => void;
   onSavings: (it: Item, idx: number, v: boolean) => void;
   onReviewed: (it: Item, idx: number, v: boolean) => void;
@@ -142,7 +147,7 @@ interface CardProps {
   onRemove: () => void;
 }
 
-function StatementCard({ it, onCategory, onSavings, onReviewed, onConfirm, onToggleAll, onRemove }: CardProps) {
+function StatementCard({ it, blockedBy, manual, onCategory, onSavings, onReviewed, onConfirm, onToggleAll, onRemove }: CardProps) {
   if (it.status === 'parsing') return <div class="card"><span class="spinner" /> Reading {it.fileName}…</div>;
   if (it.status === 'error' && !it.prep) {
     return (
@@ -158,6 +163,7 @@ function StatementCard({ it, onCategory, onSavings, onReviewed, onConfirm, onTog
   const needs = prep.rows.map((r, i) => ({ r, i })).filter(({ r }) => r.needsReview);
   const unreviewed = needs.filter(({ i }) => !it.reviewed.has(i)).length;
   const bigUnknown = prep.rows.filter((r) => r.category === 'Unidentified' && !r.isCash && r.amountUsd >= 10);
+  const dupes = manual.filter((m) => prep.rows.some((r) => Math.abs(r.amountUsd - m.amountUsd) <= 0.01 && Math.abs(Date.parse(r.date) - Date.parse(m.date)) <= 2 * 86400e3));
 
   return (
     <div class="card">
@@ -189,11 +195,11 @@ function StatementCard({ it, onCategory, onSavings, onReviewed, onConfirm, onTog
       <h3>Proof</h3>
       {!it.proof ? <p><span class="spinner" /> Checking…</p> : (
         <ul class="plain">
-          {it.proof.checks.map((c) => <li><span class={c.ok ? 'good' : 'bad'}>{c.ok ? '✓' : '✗'}</span> <strong>{c.label}</strong><br /><small>{c.detail}</small></li>)}
+          {it.proof.checks.map((c) => <li><span class={c.ok ? 'good' : c.blocking ? 'bad' : 'warn'}>{c.ok ? '✓' : c.blocking ? '✗' : '!'}</span> <strong>{c.label}</strong><br /><small>{c.detail}</small></li>)}
         </ul>
       )}
       {it.proof && !it.proof.ok && it.status !== 'done' && (
-        <div class="notice bad">This statement fails the proof check. If you confirm, the attempt is recorded but no rows are saved, and it still counts as failing at the deadline (−25). Fix it by uploading a statement that covers the missing days.</div>
+        <div class="notice bad">This statement fails the proof check. If you confirm, the attempt is recorded but no rows are saved, and it still counts as failing at the deadline (−25). Fix it by uploading a statement that covers the missing days — even after the deadline, the week then gets scored late.</div>
       )}
       {it.proof && <p class="muted">{it.proof.newRows} new rows; {p.rows.length - it.proof.newRows} already saved (skipped).</p>}
 
@@ -218,6 +224,9 @@ function StatementCard({ it, onCategory, onSavings, onReviewed, onConfirm, onTog
           </ul>
         </>
       )}
+      {dupes.length > 0 && it.status !== 'done' && (
+        <div class="notice warn">This statement has {dupes.length === 1 ? 'a row' : 'rows'} matching something you added by hand ({dupes.map((d) => `${usd(d.amountUsd)} ${d.payee}`).join('; ')}). If it's the same spending, delete the hand-added one so it isn't counted twice.</div>
+      )}
       {bigUnknown.length > 0 && it.status !== 'done' && <p class="warn">{bigUnknown.length} row(s) will stay Unidentified (counts as negotiable spending).</p>}
 
       {it.status !== 'done' && (
@@ -229,10 +238,12 @@ function StatementCard({ it, onCategory, onSavings, onReviewed, onConfirm, onTog
 
       {it.error && <div class="notice bad">{it.error}</div>}
       {it.status === 'done' && it.result ? (
-        it.result.stored ? <div class="notice good">Saved {it.result.inserted} new rows.</div> : <div class="notice bad">Recorded as a failed proof check. Nothing was saved.</div>
+        it.result.stored ? (
+          <div class={`notice ${it.result.proof.covers ? 'good' : 'warn'}`}>Saved {it.result.inserted} new rows.{!it.result.proof.covers && ' It stops before last Saturday, so upload a newer statement too.'}</div>
+        ) : <div class="notice bad">Recorded as a failed proof check. Nothing was saved.</div>
       ) : (
-        <button class="full" style={{ marginTop: 12 }} disabled={!it.proof || unreviewed > 0 || it.status === 'saving'} onClick={() => onConfirm(it)}>
-          {it.status === 'saving' ? 'Saving…' : unreviewed > 0 ? `Review ${unreviewed} more to confirm` : it.proof?.ok ? 'Confirm' : 'Record failed attempt'}
+        <button class="full" style={{ marginTop: 12 }} disabled={!it.proof || unreviewed > 0 || it.status === 'saving' || !!blockedBy} onClick={() => onConfirm(it)}>
+          {it.status === 'saving' ? 'Saving…' : blockedBy ? `Confirm ${blockedBy} first` : unreviewed > 0 ? `Review ${unreviewed} more to confirm` : it.proof?.ok ? 'Confirm' : 'Record failed attempt'}
         </button>
       )}
     </div>
@@ -256,6 +267,89 @@ function AllRows({ it, onCategory }: { it: Item; onCategory: CardProps['onCatego
         ))}
       </ul>
       {limit < rows.length && <button class="secondary full small" onClick={() => setLimit(limit + 200)}>Show more</button>}
+    </div>
+  );
+}
+
+const MONEY_IN = ['Friends paying back', 'Transfer', 'Investing'];
+
+/** Spending that will never be on an uploaded statement (another card, a friend paid, etc.). */
+function ManualEntry({ state, reload }: { state: AppState; reload: () => Promise<AppState | null> }) {
+  const [open, setOpen] = useState(false);
+  const [dir, setDir] = useState<'out' | 'in'>('out');
+  const [date, setDate] = useState(state.today);
+  const [payee, setPayee] = useState('');
+  const [amount, setAmount] = useState('');
+  const [category, setCategory] = useState('');
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const amt = Number(amount);
+  const cats = dir === 'in' ? MONEY_IN : ALL_CATEGORIES;
+  const valid = Number.isFinite(amt) && amt > 0 && payee.trim() && category && date && date <= state.today;
+
+  async function submit(e: Event) {
+    e.preventDefault();
+    if (!valid) return;
+    setBusy(true);
+    setMsg(null);
+    try {
+      const r = await api.addManual({ date, payee, amountUsd: dir === 'in' ? -amt : amt, category });
+      setMsg({ ok: true, text: `Added ${usd(amt)} ${dir === 'in' ? 'in' : ''} for ${payee}.${r.note ? ` ${r.note}` : ''}` });
+      setPayee(''); setAmount(''); setCategory('');
+      await reload();
+    } catch (err) {
+      setMsg({ ok: false, text: err instanceof Error ? err.message : String(err) });
+    }
+    setBusy(false);
+  }
+  async function remove(hash: string) {
+    try { await api.deleteManual(hash); await reload(); } catch (err) { setMsg({ ok: false, text: err instanceof Error ? err.message : String(err) }); }
+  }
+
+  return (
+    <div class="card">
+      <div class="row space">
+        <h2 style={{ margin: 0 }}>Add a transaction by hand</h2>
+        <button class="secondary small" onClick={() => setOpen(!open)} aria-expanded={open}>{open ? 'Close' : 'Add'}</button>
+      </div>
+      {open && (
+        <form onSubmit={submit}>
+          <p class="muted">Only for spending that won't appear on an uploaded statement (another card, a friend paid and you owe them…). Spending counts towards the week like statement rows. It isn't proof: the weekly statements are still needed.</p>
+          <div class="row">
+            <button type="button" class={dir === 'out' ? '' : 'secondary'} onClick={() => { setDir('out'); setCategory(''); }}>Money out</button>
+            <button type="button" class={dir === 'in' ? '' : 'secondary'} onClick={() => { setDir('in'); setCategory(''); }}>Money in</button>
+          </div>
+          <label for="m-date">Date</label>
+          <input id="m-date" type="date" max={state.today} value={date} onInput={(e) => setDate((e.target as HTMLInputElement).value)} required />
+          <label for="m-payee">What / where</label>
+          <input id="m-payee" maxLength={120} value={payee} onInput={(e) => setPayee((e.target as HTMLInputElement).value)} required />
+          <label for="m-amt">Amount (USD)</label>
+          <input id="m-amt" type="number" inputMode="decimal" step="0.01" min="0.01" value={amount} onInput={(e) => setAmount((e.target as HTMLInputElement).value)} required />
+          <label for="m-cat">Category</label>
+          <select id="m-cat" value={category} onChange={(e) => setCategory((e.target as HTMLSelectElement).value)} required>
+            <option value="">Pick…</option>
+            {cats.map((c) => <option value={c}>{c}</option>)}
+          </select>
+          {dir === 'in' && <p class="muted">Money in added by hand shows in History but doesn't reduce your weekly spending — only statements can prove it.</p>}
+          {dir === 'out' && (category === 'Transfer' || category === 'Investing') && <p class="muted">Savings only count when a statement shows them.</p>}
+          <button class="full" style={{ marginTop: 12 }} disabled={!valid || busy}>{busy ? 'Adding…' : 'Add transaction'}</button>
+        </form>
+      )}
+      {msg && <div class={`notice ${msg.ok ? 'good' : 'bad'}`}>{msg.text}</div>}
+      {state.manual.length > 0 && (
+        <details style={{ marginTop: 8 }}>
+          <summary>Added by hand ({state.manual.length})</summary>
+          <ul class="plain">
+            {state.manual.map((m) => (
+              <li>
+                <div class="row space"><span class="ellipsis grow">{m.payee}</span><strong class={m.amountUsd < 0 ? 'good' : ''}>{usd(-m.amountUsd)}</strong></div>
+                <small class="muted">{formatDate(m.date)} · {m.category}{m.savings ? ' · savings' : ''}</small>
+                {Date.now() - m.createdAt < 24 * 3600e3 && <div><button class="secondary small" onClick={() => remove(m.hash)}>Delete</button></div>}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
     </div>
   );
 }

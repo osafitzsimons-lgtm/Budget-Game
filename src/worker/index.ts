@@ -1,6 +1,6 @@
 import { verifyAccess, type AuthEnv } from './auth';
 import {
-  addLog, checkUpload, confirmUpload, deleteLog, exportPage, getHistory, getState, HttpError, importCsv, renameCreature, saveAccount, saveSettings,
+  addLog, addManualTx, checkUpload, deleteManualTx, confirmUpload, deleteLog, exportPage, getHistory, getState, HttpError, importCsv, renameCreature, saveAccount, saveSettings,
 } from './api';
 import { ensureSchema } from './db';
 
@@ -61,6 +61,8 @@ export async function handleApi(req: Request, env: Env, now = Date.now()): Promi
     if (m === 'POST' && p === '/api/uploads/confirm') return json(await confirmUpload(db, await readJson(req), now));
     if (m === 'POST' && p === '/api/logs') return json(await addLog(db, await readJson(req), now));
     if (m === 'DELETE' && p.startsWith('/api/logs/')) return json(await deleteLog(db, decodeURIComponent(p.slice('/api/logs/'.length)), now));
+    if (m === 'POST' && p === '/api/transactions') return json(await addManualTx(db, await readJson(req), now));
+    if (m === 'DELETE' && p.startsWith('/api/transactions/')) return json(await deleteManualTx(db, decodeURIComponent(p.slice('/api/transactions/'.length)), now));
     if (m === 'POST' && p === '/api/settings') return json(await saveSettings(db, await readJson(req), now));
     if (m === 'POST' && p === '/api/accounts') return json(await saveAccount(db, await readJson(req)));
     if (m === 'POST' && p === '/api/creature/name') return json(await renameCreature(db, await readJson(req), now));

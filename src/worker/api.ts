@@ -1,15 +1,16 @@
 import { capBucket, isCategory, isNegotiable, OTHER_CAP } from '../shared/categories';
 import { isBuiltInPayee, learnRules } from '../shared/categorise';
-import { addDays, isYmd, monthOf, ppDate, weekDeadline, weekEnd, weekStart } from '../shared/dates';
+import { addDays, formatDate, isYmd, monthOf, ppDate, weekDeadline, weekEnd, weekStart } from '../shared/dates';
 import { bankForLabel } from '../shared/history';
 import { round2, sameMoney } from '../shared/money';
 import { maskPayee, payeeKey } from '../shared/privacy';
+import { sha256Hex } from '../shared/hash';
 import { checkProof } from '../shared/proof';
-import { findUnlogged, penaltyMonth, savedInWindow, savingsWindow, DEATH_SAVINGS_PENALTY } from '../shared/scoring';
-import { phaseValue, validateSettings, type Settings } from '../shared/settings';
+import { accountStatus, findUnlogged, penaltyMonth, savedInWindow, savingsWindow, DEATH_SAVINGS_PENALTY } from '../shared/scoring';
+import { DEFAULT_SETTINGS, phaseValue, validateSettings, type Phase, type Settings } from '../shared/settings';
 import type { StatementSummary } from '../shared/types';
 import { type Core, loadCore, rowToLog, rowToTx } from './db';
-import { scoreDueWeeks, type EvalOutcome } from './evaluate';
+import { requiredIds, SCORED_SOURCES, scoreDueWeeks, type EvalOutcome } from './evaluate';
 
 export class HttpError extends Error {
   constructor(public status: number, message: string) {
@@ -39,9 +40,15 @@ function ymd(v: unknown, name: string): string {
 async function evaluateAndLoad(db: D1Database, now: number): Promise<{ core: Core; outcome: EvalOutcome | null }> {
   const today = ppDate(now);
   let core = await loadCore(db, now, weekStart(today));
-  const deaths = core.creatures.filter((c) => c.diedAt !== null).map((c) => ({ diedAt: c.diedAt! }));
-  const outcome = await scoreDueWeeks({ db, now, settings: core.settings, accounts: core.accounts, uploads: core.uploads, evaluated: core.evaluated, creature: core.creature, deaths });
-  if (outcome) core = await loadCore(db, now, weekStart(today));
+  let outcome: EvalOutcome | null = null;
+  // A second pass catches a week that was penalised at its deadline in pass one and whose statements are already in.
+  for (let pass = 0; pass < 2; pass++) {
+    const deaths = core.creatures.filter((c) => c.diedAt !== null).map((c) => ({ diedAt: c.diedAt! }));
+    const o = await scoreDueWeeks({ db, now, settings: core.settings, accounts: core.accounts, uploads: core.uploads, evaluated: core.evaluated, awaitingLate: core.awaitingLate, creature: core.creature, deaths });
+    if (!o) break;
+    outcome = outcome ? { before: outcome.before, after: o.after, events: [...outcome.events, ...o.events], weeks: [...outcome.weeks, ...o.weeks], died: outcome.died || o.died } : o;
+    core = await loadCore(db, now, weekStart(today));
+  }
   return { core, outcome };
 }
 
@@ -59,13 +66,14 @@ async function buildState(db: D1Database, core: Core, now: number) {
   const win = savingsWindow(month, s.savingsWindowStartDay);
   const from = [addDays(ws, -2), `${month}-01`, win.from].sort()[0];
 
-  const [txRes, logRes, ruleRes, evRes, cashRes] = await db.batch([
-    db.prepare(`SELECT * FROM transactions WHERE source = 'pdf' AND date >= ?1`).bind(from),
+  const [txRes, logRes, ruleRes, evRes, cashRes, manualRes] = await db.batch([
+    db.prepare(`SELECT * FROM transactions WHERE ${SCORED_SOURCES} AND date >= ?1`).bind(from),
     db.prepare(`SELECT * FROM logs ORDER BY created_at DESC LIMIT 300`),
     db.prepare(`SELECT key, category FROM payee_rules`),
     db.prepare(`SELECT * FROM score_events ORDER BY id DESC LIMIT 400`),
     db.prepare(`SELECT t.hash, t.date, t.payee, t.amount_usd, t.account_id, (SELECT COALESCE(SUM(l.amount_usd),0) FROM logs l WHERE l.cash_tx_hash = t.hash) AS logged
                 FROM transactions t WHERE t.is_cash = 1 AND t.date >= ?1 ORDER BY t.date DESC`).bind(addDays(today, -60)),
+    db.prepare(`SELECT hash, date, payee, amount_usd, category, savings, created_at FROM transactions WHERE source = 'manual' ORDER BY created_at DESC LIMIT 100`),
   ]);
   const txs = (txRes.results as Record<string, unknown>[]).map(rowToTx);
   const logs = (logRes.results as Record<string, unknown>[]).map(rowToLog);
@@ -108,6 +116,13 @@ async function buildState(db: D1Database, core: Core, now: number) {
   while (core.evaluated.has(dw) || weekDeadline(dw) <= now) dw = addDays(dw, 7);
 
   const required = core.accounts.filter((a) => a.active && !a.optional);
+  const requiredList = requiredIds(core.accounts);
+  // Missed weeks still waiting for late statements, with what is still needed.
+  const awaitingLate = [...core.awaitingLate].sort().map((w) => ({
+    weekStart: w,
+    weekEnd: weekEnd(w),
+    needed: requiredList.filter((id) => accountStatus(core.uploads, id, weekEnd(w), now, w > s.scoringStart ? w : undefined) !== 'ok'),
+  }));
   const lastByAccount = core.accounts.map((a) => {
     const mine = core.uploads.filter((u) => u.accountId === a.id);
     const good = mine.filter((u) => u.ok).sort((x, y) => (x.periodEnd < y.periodEnd ? -1 : 1));
@@ -138,6 +153,8 @@ async function buildState(db: D1Database, core: Core, now: number) {
     rules: (ruleRes.results as { key: string; category: string }[]).map((r) => [r.key, r.category] as [string, string]),
     logs,
     cash: (cashRes.results as Record<string, unknown>[]).map((r) => ({ hash: String(r.hash), date: String(r.date), payee: String(r.payee), amountUsd: Number(r.amount_usd), accountId: String(r.account_id), logged: Number(r.logged) })),
+    manual: (manualRes.results as Record<string, unknown>[]).map((r) => ({ hash: String(r.hash), date: String(r.date), payee: String(r.payee), amountUsd: Number(r.amount_usd), category: String(r.category), savings: !!r.savings, createdAt: Number(r.created_at) })),
+    awaitingLate,
   };
 }
 
@@ -199,6 +216,12 @@ function parseRows(v: unknown, st: StatementIn): RowIn[] {
   });
 }
 
+function checkFx(core: Core, st: StatementIn) {
+  if (st.currency === 'GBP' && Math.abs(st.fx - core.settings.fxGbpUsd) > 1e-9)
+    throw bad(`The GBP→USD rate changed to ${core.settings.fxGbpUsd} since this file was read. Pick the file again.`);
+  if (st.currency === 'USD' && st.fx !== 1) throw bad('USD statements must not be converted.');
+}
+
 async function proofFor(db: D1Database, core: Core, st: StatementIn, rows: { hash: string; balance: number }[], now: number) {
   const acct = core.accounts.find((a) => a.id === st.accountId);
   const accountOk = !!acct && acct.active && acct.bank === st.bank && acct.last3 === st.last3;
@@ -212,7 +235,12 @@ async function proofFor(db: D1Database, core: Core, st: StatementIn, rows: { has
     const r = await db.prepare(`SELECT hash FROM transactions WHERE hash IN (SELECT value FROM json_each(?1))`).bind(JSON.stringify(rows.map((x) => x.hash))).all<{ hash: string }>();
     for (const x of r.results) known.add(x.hash);
   }
-  return checkProof({ statement: st, rows, lastGood: lastGood ? { periodEnd: lastGood.periodEnd, closing: lastGood.closing } : null, knownHashes: known, today: ppDate(now), accountOk, accountDetail });
+  const firstGood = [...good].sort((a, b) => (a.periodStart < b.periodStart ? -1 : a.periodStart > b.periodStart ? 1 : a.uploadedAt - b.uploadedAt))[0] ?? null;
+  return checkProof({
+    statement: st, rows, knownHashes: known, today: ppDate(now), accountOk, accountDetail,
+    lastGood: lastGood ? { periodEnd: lastGood.periodEnd, closing: lastGood.closing } : null,
+    firstGood: firstGood ? { periodStart: firstGood.periodStart, opening: firstGood.opening } : null,
+  });
 }
 
 /** The rows must chain from the opening balance to the closing balance; otherwise reject. */
@@ -234,6 +262,7 @@ export async function checkUpload(db: D1Database, body: unknown, now: number) {
   const rows = parseRows(o.rows, st);
   checkChain(st, rows);
   const core = await loadCore(db, now, weekStart(ppDate(now)));
+  checkFx(core, st);
   return proofFor(db, core, st, rows, now);
 }
 
@@ -247,6 +276,7 @@ export async function confirmUpload(db: D1Database, body: unknown, now: number) 
   // Score any weeks whose deadline passed BEFORE this upload, so a late upload can't rescue them.
   const first = await evaluateAndLoad(db, now);
   const core = first.core;
+  checkFx(core, st);
   const proof = await proofFor(db, core, st, rows, now);
   const accountCheck = proof.checks.find((c) => c.id === 'account');
   if (!accountCheck?.ok) throw bad(accountCheck?.detail ?? 'Wrong account.');
@@ -339,13 +369,49 @@ export async function deleteLog(db: D1Database, id: string, now: number) {
 
 // ---------- Settings & accounts ----------
 
+function cleanPhases<T>(v: unknown, name: string, cleanValue: (x: unknown) => T): Phase<T>[] {
+  if (!Array.isArray(v) || v.length < 1 || v.length > 6) throw bad(`${name}: needs 1–6 periods.`);
+  const out = v.map((p, i) => {
+    const o = (p ?? {}) as Record<string, unknown>;
+    const until = i === v.length - 1 ? null : ymd(o.until, `${name} end date`);
+    return { until, value: cleanValue(o.value) };
+  });
+  for (let i = 1; i < out.length - 1; i++) if ((out[i].until as string) <= (out[i - 1].until as string)) throw bad(`${name}: end dates must go forwards.`);
+  return out;
+}
+
+/** Only known settings, with the right types. Anything else in the request is ignored. */
+function cleanSettings(incoming: Record<string, unknown>, current: Settings): Settings {
+  const pick = <K extends keyof Settings>(k: K): unknown => (k in incoming ? incoming[k] : current[k]);
+  const money = (x: unknown) => { const n = num(x, 'Amount'); if (n < 0 || n > 1e6) throw bad('Amounts must be between 0 and 1,000,000.'); return Math.round(n * 100) / 100; };
+  const capKeys = Object.keys(DEFAULT_SETTINGS.caps[0].value);
+  const caps = (x: unknown) => {
+    const o = (x ?? {}) as Record<string, unknown>;
+    return Object.fromEntries(capKeys.map((k) => [k, money(o[k] ?? 0)]));
+  };
+  const words = (x: unknown, max: number) => (Array.isArray(x) ? x : []).map((w) => str(w, 'Word', 60, true)).filter(Boolean).slice(0, max);
+  return {
+    creatureName: str(pick('creatureName'), 'Name', 40),
+    allowance: cleanPhases(pick('allowance'), 'Allowance', money),
+    savingsTarget: cleanPhases(pick('savingsTarget'), 'Savings target', money),
+    caps: cleanPhases(pick('caps'), 'Caps', caps),
+    fxGbpUsd: num(pick('fxGbpUsd'), 'GBP→USD rate'),
+    savingsAccountId: str(pick('savingsAccountId') ?? '', 'Savings account', 40, true),
+    savingsKeywords: words(pick('savingsKeywords'), 20),
+    ownNames: words(pick('ownNames'), 10),
+    savingsWindowStartDay: num(pick('savingsWindowStartDay'), 'Savings start day'),
+    deliveryWeeklyCap: money(pick('deliveryWeeklyCap')),
+    // Fixed once set: the halving date and when scoring started.
+    halveNegativesBefore: current.halveNegativesBefore,
+    scoringStart: current.scoringStart,
+  };
+}
+
 export async function saveSettings(db: D1Database, body: unknown, now: number) {
   const core = await loadCore(db, now, weekStart(ppDate(now)));
-  const incoming = ((body ?? {}) as { settings?: Partial<Settings> }).settings ?? {};
-  // scoringStart and the halving date are fixed once set.
-  const next: Settings = { ...core.settings, ...incoming, scoringStart: core.settings.scoringStart, halveNegativesBefore: core.settings.halveNegativesBefore };
-  next.savingsKeywords = (next.savingsKeywords ?? []).map((k) => String(k).trim()).filter(Boolean).slice(0, 20);
-  next.ownNames = (next.ownNames ?? []).map((k) => String(k).trim()).filter(Boolean).slice(0, 10);
+  const incoming = ((body ?? {}) as { settings?: unknown }).settings;
+  if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) throw bad('Expected settings.');
+  const next = cleanSettings(incoming as Record<string, unknown>, core.settings);
   if (next.savingsAccountId && !core.accounts.some((a) => a.id === next.savingsAccountId)) throw bad('Savings account must be one of your accounts.');
   const errs = validateSettings(next);
   if (errs.length) throw bad(errs.join(' '));
@@ -354,6 +420,47 @@ export async function saveSettings(db: D1Database, body: unknown, now: number) {
     db.prepare(`UPDATE creatures SET name = ?1 WHERE died_at IS NULL`).bind(next.creatureName),
   ]);
   return { settings: next };
+}
+
+// ---------- Transactions added by hand ----------
+
+const MONEY_IN_OK = new Set(['Friends paying back', 'Transfer', 'Investing']);
+
+/**
+ * For spending that will never appear on an uploaded statement (another card, someone else paid, etc.).
+ * Spending counts towards the week like statement rows. Money in is recorded for History only (no proof),
+ * and only as Friends paying back or Transfer/Investing.
+ */
+export async function addManualTx(db: D1Database, body: unknown, now: number) {
+  const o = (body ?? {}) as Record<string, unknown>;
+  const today = ppDate(now);
+  const date = ymd(o.date, 'Date');
+  if (date > today) throw bad('The date can’t be in the future.');
+  if (date < addDays(today, -400)) throw bad('That date is too far back.');
+  const payee = maskPayee(str(o.payee, 'What / where', 120));
+  const amountUsd = Math.round(num(o.amountUsd, 'Amount') * 100) / 100;
+  if (amountUsd === 0 || Math.abs(amountUsd) > 100000) throw bad('Amount must be non-zero and under $100,000.');
+  const category = str(o.category, 'Category', 40);
+  if (!isCategory(category)) throw bad('Unknown category.');
+  if (amountUsd < 0 && !MONEY_IN_OK.has(category)) throw bad('Money in can only be “Friends paying back”, Transfer or Investing.');
+  // Savings must be proven by a statement, so hand-added rows never count as saved.
+  const savings = false;
+  const hash = await sha256Hex(`manual|${crypto.randomUUID()}`);
+  await db.prepare(
+    `INSERT INTO transactions (hash, account_id, bank, source, date, time, payee, amount_orig, currency, amount_usd, balance, category, savings, is_cash, upload_id, seq, created_at)
+     VALUES (?1, 'manual', 'MANUAL', 'manual', ?2, NULL, ?3, ?4, 'USD', ?4, NULL, ?5, ?6, 0, NULL, 0, ?7)`,
+  ).bind(hash, date, payee, amountUsd, category, savings ? 1 : 0, now).run();
+  const closed = await db.prepare(`SELECT data_ok FROM week_evals WHERE week_start = ?1`).bind(weekStart(date)).first<{ data_ok: number }>();
+  return { hash, note: closed && closed.data_ok ? `The week of ${formatDate(weekStart(date))} was already scored, so this only shows in History.` : null };
+}
+
+export async function deleteManualTx(db: D1Database, hash: string, now: number) {
+  if (!HEX64.test(hash)) throw bad('Bad id.');
+  const t = await db.prepare(`SELECT created_at FROM transactions WHERE hash = ?1 AND source = 'manual'`).bind(hash).first<{ created_at: number }>();
+  if (!t) throw new HttpError(404, 'Not found.');
+  if (now - Number(t.created_at) > 24 * 3600e3) throw bad('Hand-added transactions older than a day can’t be deleted.');
+  await db.prepare(`DELETE FROM transactions WHERE hash = ?1 AND source = 'manual'`).bind(hash).run();
+  return { ok: true };
 }
 
 export async function saveAccount(db: D1Database, body: unknown) {
