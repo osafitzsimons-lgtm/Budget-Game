@@ -161,3 +161,20 @@ npm test
 ```
 
 To also check against your real statements, put copies in `private-fixtures/` (see the README there). That folder is never committed.
+
+---
+
+## Troubleshooting
+
+**The Worker is called something other than `budget-guy` (e.g. `budget-game`).**
+If you connected the repository before naming the Worker, Cloudflare may have named it after the repository. Its builds then quietly deploy under that name, so the app lives at `budget-game.<you>.workers.dev`.
+- Fix it in the dashboard: **Workers & Pages → (your Worker) → Settings → General → Name** → change it to `budget-guy`.
+- If renaming isn't offered, delete that Worker and redo step 4, typing `budget-guy`.
+- If Cloudflare's bot opens a pull request changing the name in `wrangler.jsonc` to anything else, close it without merging.
+- After renaming, set up Access (step 5) and the variables (step 6) for `budget-guy`, if you had done them on the old Worker.
+
+**The deploy fails with a database error.** Check step 3: `wrangler.jsonc` must contain your real D1 Database ID, not `REPLACE-WITH-YOUR-D1-DATABASE-ID`.
+
+**The app says "Server is missing TEAM_DOMAIN, POLICY_AUD or ALLOWED_EMAIL".** Step 6 isn't finished. The app refuses everything until all three are set.
+
+**Branch previews show "This is a preview build. It has no database".** That's on purpose: previews can never touch your real data.
