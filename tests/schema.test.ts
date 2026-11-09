@@ -6,8 +6,10 @@ describe('schema', () => {
   it('migrations/0001_init.sql matches the schema the Worker applies (run `npm run schema`)', () => {
     expect(readFileSync('migrations/0001_init.sql', 'utf8')).toBe(schemaSql());
   });
-  it('wrangler config names the Worker budget-guy', () => {
-    expect(readFileSync('wrangler.jsonc', 'utf8')).toMatch(/"name":\s*"budget-guy"/);
+  it('wrangler config names the Worker as it exists in Cloudflare (budget-game) and needs no database ID', () => {
+    const cfg = readFileSync('wrangler.jsonc', 'utf8');
+    expect(cfg).toMatch(/"name":\s*"budget-game"/);
+    expect(cfg).not.toMatch(/"database_id"/);
   });
   it('gitignore keeps statements, CSVs and secrets out of git', () => {
     const g = readFileSync('.gitignore', 'utf8');
