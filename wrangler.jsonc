@@ -1,0 +1,36 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  // Must match the Worker name in the Cloudflare dashboard (Workers Builds checks this).
+  "name": "budget-guy",
+  "main": "./src/worker/index.ts",
+  "compatibility_date": "2026-11-09",
+  // Keep variables/secrets you set in the dashboard when Workers Builds redeploys.
+  "keep_vars": true,
+  "workers_dev": true,
+  // Wrangler builds the front end (Vite → ./dist) before every deploy, preview and local dev.
+  "build": {
+    "command": "npm run build",
+    "watch_dir": ["src/web", "src/shared", "src/parsers", "public", "index.html"]
+  },
+  "assets": {
+    "directory": "./dist/",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    // Only /api/* runs Worker code. Everything else is a free static-asset request.
+    "run_worker_first": ["/api/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "budget-guy-db",
+      // SETUP.md step 3: replace this with the Database ID shown in the Cloudflare dashboard.
+      "database_id": "REPLACE-WITH-YOUR-D1-DATABASE-ID"
+    }
+  ],
+  // Branch previews get NO database and no secrets, so a preview can never read or
+  // change your real data. Their /api calls fail closed with a clear message.
+  "previews": {
+    "vars": { "IS_PREVIEW": "true" }
+  },
+  "observability": { "enabled": false }
+}
