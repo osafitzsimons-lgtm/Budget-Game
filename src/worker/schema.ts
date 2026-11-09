@@ -17,10 +17,19 @@ export const SCHEMA: string[] = [
   // data_ok = 0: the week took a missing/failing penalty and waits for late statements.
   `CREATE TABLE IF NOT EXISTS week_evals (week_start TEXT PRIMARY KEY, evaluated_at INTEGER NOT NULL, early INTEGER NOT NULL, data_ok INTEGER NOT NULL DEFAULT 1)`,
   // One row per missed week that was later scored from late statements (the primary key stops double scoring).
+  // One row per saved upload per account: two uploads racing for the same slot can't both be saved.
+  `CREATE TABLE IF NOT EXISTS upload_seq (account_id TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (account_id, seq))`,
   `CREATE TABLE IF NOT EXISTS late_evals (week_start TEXT PRIMARY KEY, evaluated_at INTEGER NOT NULL)`,
   `INSERT OR IGNORE INTO accounts (id, bank, last3, label, optional, active, sort) VALUES ('ABA-812', 'ABA', '812', 'ABA 812', 0, 1, 1), ('ABA-013', 'ABA', '013', 'ABA 013', 0, 1, 2), ('ABA-811', 'ABA', '811', 'ABA 811', 1, 1, 3), ('REV-554', 'REV', '554', 'Revolut 554', 0, 1, 4)`,
   `INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')`,
 ];
+
+/**
+ * Later changes to existing tables. Each runs once, in order, and bumps meta.schema_version.
+ * (Version 1 is everything in SCHEMA above.) Example for the future:
+ *   { version: 2, statements: [`ALTER TABLE logs ADD COLUMN note TEXT`] }
+ */
+export const MIGRATIONS: { version: number; statements: string[] }[] = [];
 
 export function schemaSql(): string {
   return `-- Generated from src/worker/schema.ts by \`npm run schema\`. Safe to run more than once.\n${SCHEMA.map((s) => `${s};`).join('\n')}\n`;

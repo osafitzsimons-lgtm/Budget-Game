@@ -6,7 +6,8 @@ import { usd } from '../../shared/money';
 import { contextFrom, findAccount, prepareStatement, type PreparedStatement } from '../../shared/statement';
 import type { ProofResult } from '../../shared/types';
 import type { ParsedStatement } from '../../parsers/index';
-import { api, type AppState, type ConfirmResult } from '../api';
+import { api, post, type AppState } from '../api';
+import { submitStatement, type SubmitResult } from '../../shared/submit';
 import type { ScreenProps } from '../app';
 import { CreatureView, EventList } from '../components';
 import { parsePdfFile } from '../pdf';
@@ -23,7 +24,8 @@ interface Item {
   /** row index → reviewed (kept as is) */
   reviewed: Set<number>;
   changed: Set<number>;
-  result?: ConfirmResult;
+  result?: SubmitResult;
+  progress?: string;
   showAll?: boolean;
 }
 
@@ -31,7 +33,7 @@ const money = (n: number, cur: 'USD' | 'GBP') => (cur === 'GBP' ? `£${n.toFixed
 
 export function Upload({ state, reload }: ScreenProps) {
   const [items, setItems] = useState<Item[]>([]);
-  const [anim, setAnim] = useState<ConfirmResult | null>(null);
+  const [anim, setAnim] = useState<SubmitResult | null>(null);
   const update = (key: string, f: (i: Item) => Item) => setItems((xs) => xs.map((x) => (x.key === key ? f(x) : x)));
 
   const ctx = contextFrom(state.rules, state.accounts, state.settings);
@@ -67,7 +69,7 @@ export function Upload({ state, reload }: ScreenProps) {
   async function runCheck(it: Item) {
     if (!it.prep) return;
     try {
-      const proof = await api.check(it.prep.summary, it.prep.rows);
+      const proof = await api.check(it.prep.summary, it.prep.rows.map((r) => ({ hash: r.hash, balance: r.balance })));
       update(it.key, (x) => ({ ...x, proof }));
     } catch (e) {
       update(it.key, (x) => ({ ...x, status: 'error', error: e instanceof Error ? e.message : String(e) }));
@@ -102,9 +104,11 @@ export function Upload({ state, reload }: ScreenProps) {
     update(it.key, (x) => ({ ...x, status: 'saving' }));
     try {
       const rules = [...it.changed].map((i) => ({ payee: it.prep!.rows[i].payee, category: it.prep!.rows[i].category }));
-      const result = await api.confirm(it.prep.summary, it.prep.rows, rules);
-      update(it.key, (x) => ({ ...x, status: 'done', result, proof: result.proof }));
-      if (result.events.length || result.healthBefore !== result.healthAfter) setAnim(result);
+      const result = await submitStatement(post, it.prep.summary, it.prep.rows, rules, (done, total) => {
+        if (total > 1) update(it.key, (x) => ({ ...x, progress: `Saving part ${Math.min(done + 1, total)} of ${total}…` }));
+      });
+      update(it.key, (x) => ({ ...x, status: 'done', result, proof: result.proof, progress: undefined }));
+      if (result.healthBefore !== null && result.healthAfter !== null && (result.events.length || result.healthBefore !== result.healthAfter)) setAnim(result);
       const fresh = await reload();
       // Re-check the other statements: the next one for the same account now chains from this one.
       if (fresh) for (const other of items) if (other.key !== it.key && other.status === 'ready') void runCheck(other);
@@ -118,7 +122,7 @@ export function Upload({ state, reload }: ScreenProps) {
       <h1>Upload statements</h1>
       {anim && (
         <div class="card">
-          <CreatureView name={state.creature.name} before={anim.healthBefore} after={anim.healthAfter} died={anim.died} />
+          <CreatureView name={state.creature.name} before={anim.healthBefore ?? state.creature.health} after={anim.healthAfter ?? state.creature.health} died={anim.died} />
           {anim.events.length > 0 && <EventList events={anim.events} />}
         </div>
       )}
@@ -243,7 +247,7 @@ function StatementCard({ it, blockedBy, manual, onCategory, onSavings, onReviewe
         ) : <div class="notice bad">Recorded as a failed proof check. Nothing was saved.</div>
       ) : (
         <button class="full" style={{ marginTop: 12 }} disabled={!it.proof || unreviewed > 0 || it.status === 'saving' || !!blockedBy} onClick={() => onConfirm(it)}>
-          {it.status === 'saving' ? 'Saving…' : blockedBy ? `Confirm ${blockedBy} first` : unreviewed > 0 ? `Review ${unreviewed} more to confirm` : it.proof?.ok ? 'Confirm' : 'Record failed attempt'}
+          {it.status === 'saving' ? (it.progress ?? 'Saving…') : blockedBy ? `Confirm ${blockedBy} first` : unreviewed > 0 ? `Review ${unreviewed} more to confirm` : it.proof?.ok ? 'Confirm' : 'Record failed attempt'}
         </button>
       )}
     </div>

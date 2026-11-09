@@ -43,7 +43,7 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+export async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   let res: Response;
   try {
     res = await fetch(path, {
@@ -80,3 +80,6 @@ export const api = {
   history: () => request<{ rows: [string, string, 'pdf' | 'csv', string, number][] }>('GET', '/api/history'),
   exportPage: (table: string, after: string) => request<{ columns: string[]; rows: unknown[][]; done: boolean }>('GET', `/api/export?table=${encodeURIComponent(table)}&after=${encodeURIComponent(after)}`),
 };
+
+/** POST helper for the shared statement/history submitters. */
+export const post = <T,>(path: string, body: unknown) => request<T>('POST', path, body);

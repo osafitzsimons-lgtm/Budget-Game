@@ -1,7 +1,7 @@
 import { formatDate, parseAbaDate } from '../shared/dates';
-import { round2, sameMoney } from '../shared/money';
-import { amountPhrases, findAccountLast3, findPeriod, firstBalanceBreak, parseTime, sum } from './common';
-import { center, type Column, furnitureDetector, type Line, matchHeader, nearestColumn, StatementError } from './lines';
+import { parseAmount, round2, sameMoney } from '../shared/money';
+import { DASH_ONLY, findAccountLast3, findPeriod, firstBalanceBreak, isNote, NOT_A_PAYEE, parseTime, sum } from './common';
+import { center, type Column, furnitureDetector, type Line, matchHeader, nearestColumn, type Phrase, StatementError } from './lines';
 import type { ParsedRow, ParsedStatement } from './types';
 
 const HEADER = {
@@ -12,112 +12,189 @@ const HEADER = {
   bal: /balance/i,
 };
 
-const ROW_DATE_AT_START = /^((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})\s*(.*)$/i;
-const OPENING = /(opening|beginning|previous|brought\s+forward|b\/f).*balance|balance.*(brought\s+forward|b\/f)/i;
-const CLOSING = /(closing|ending|end of period).*balance|balance.*carried/i;
+const ACCOUNT_LABEL = /\b(?:account\s*(?:no\.?|number|#)|a\/c\s*(?:no\.?|number)?)\s*[:.]?/i;
+const DATE_AT_START = /^((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})\s*(.*)$/i;
+const TIME_AT_START = /^(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)(?:\s+(.*))?$/i;
+// Summary lines must START with these words, so "VENDING MACHINE BALANCE" or "PAYMENT OF PREVIOUS BALANCE" in a
+// wrapped description is never mistaken for one.
+const OPENING = /^(?:(?:opening|beginning|starting|previous)\s+balance|balance\s+(?:brought\s+forward|b\/f)|brought\s+forward)\b/i;
+const CLOSING = /^(?:closing|ending)\s+balance\b/i;
+const CARRIED = /^(?:balance\s+carried\s+forward|carried\s+forward|balance\s+c\/f)\b/i;
+const TOTALS = /^(?:sub-?\s?total|total)\b/i;
+const LOOKS_LIKE_MONEY = /\d[\d,]*\.\d{2}/;
 
+function headerIndex(lines: Line[]): number {
+  return lines.findIndex((l) => matchHeader(l, HEADER));
+}
+
+/** An ABA statement: the bank's name above the transactions table (or its full name/website anywhere). */
 export function looksLikeAba(lines: Line[]): boolean {
-  const head = lines.slice(0, 80).map((l) => l.text).join('\n');
-  return /\bABA\b|Advanced Bank of Asia/i.test(head) && lines.some((l) => matchHeader(l, HEADER));
+  const h = headerIndex(lines);
+  if (h < 0) return false;
+  const head = lines.slice(0, h).map((l) => l.text).join('\n');
+  return /\bABA\b|Advanced Bank of Asia|ababank/i.test(head) || lines.some((l) => /Advanced Bank of Asia|ababank\.com/i.test(l.text));
 }
 
 interface Cols { date: Column; desc: Column; in: Column; out: Column; bal: Column }
+interface Anchor { page: number; y: number; h: number }
 
 export function parseAba(lines: Line[]): ParsedStatement {
   const notes: string[] = [];
-  const isFurniture = furnitureDetector(lines);
-  const firstHeader = lines.findIndex((l) => matchHeader(l, HEADER));
-  if (firstHeader < 0) throw new StatementError('ABA statement: could not find the table header (Date / Description / Money In / Money Out / Balance).');
+  const h0 = headerIndex(lines);
+  if (h0 < 0) throw new StatementError('ABA statement: could not find the table header (Date / Description / Money In / Money Out / Balance).');
 
-  const headerLines = lines.slice(0, firstHeader).filter((l) => l.page === lines[firstHeader].page || l.page === 1);
-  const accountLast3 = findAccountLast3(headerLines, /account\s*(?:no\.?|number|#)?\s*[:.]?/i, 'ABA');
-  const period = findPeriod(lines, firstHeader);
+  const head = lines.slice(0, h0).map((l) => l.text).join('\n');
+  const cur = /currency\s*:?\s*([A-Z]{3})\b/i.exec(head);
+  if (cur && cur[1].toUpperCase() !== 'USD')
+    throw new StatementError(`This ABA statement is in ${cur[1].toUpperCase()}. Only USD accounts are supported. Nothing was saved.`);
+
+  // Account numbers are read from labels anywhere in the PDF: two different accounts in one file is an error.
+  const accountLast3 = findAccountLast3(lines, ACCOUNT_LABEL, 'ABA');
+  const period = findPeriod(lines, h0);
+  const isFurniture = furnitureDetector(lines);
 
   let opening: number | null = null;
   let closing: number | null = null;
-  const rows: (ParsedRow & { _page: number; _y: number })[] = [];
+  const rows: ParsedRow[] = [];
   let cols: Cols | null = null;
-  let last: { page: number; y: number; h: number } | null = null;
+  /** the last line that belongs to the last row */
+  let last: Anchor | null = null;
+  /** a wrapped line may still follow on the same page (false once anything else has appeared below the row) */
+  let rowOpen = false;
+  /** true right after a repeated table header on a new page: a wrapped line may carry over from the last row */
+  let afterHeader = false;
+  /** description text printed just ABOVE its date line (vertically centred cells) */
+  let prefix: string[] = [];
+  const pageSum = new Map<number, { in: number; out: number }>();
+  const total = { in: 0, out: 0 };
+
+  const rowError = (line: Line, why: string) =>
+    new StatementError(`ABA page ${line.page}: couldn't read a row (${why}): "${line.text.slice(0, 80)}". Stopped — nothing was saved.`);
+
+  /** Read the amounts in the Money In / Money Out / Balance columns. Anything unreadable there stops the upload. */
+  const readAmounts = (line: Line, zone: Phrase[]) => {
+    const out: { col: 'in' | 'out' | 'bal'; v: number }[] = [];
+    for (const p of zone) {
+      if (DASH_ONLY.test(p.text)) continue; // "-" placeholder in an empty column
+      const v = parseAmount(p.text);
+      if (v === null) {
+        // Something that looks like money but can't be read exactly stops the upload; other text is ignored.
+        if (LOOKS_LIKE_MONEY.test(p.text)) throw rowError(line, `unreadable amount "${p.text}"`);
+        continue;
+      }
+      const c = nearestColumn(p, [cols!.in, cols!.out, cols!.bal]);
+      out.push({ col: c === cols!.in ? 'in' : c === cols!.out ? 'out' : 'bal', v });
+    }
+    return out;
+  };
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const header = matchHeader(line, HEADER) as Cols | null;
-    if (header) { cols = header; last = null; continue; }
-
-    // Summary lines can sit above or inside the table.
-    if ((OPENING.test(line.text) || CLOSING.test(line.text)) && !ROW_DATE_AT_START.test(line.phrases[0]?.text ?? '')) {
-      const amts = amountPhrases(line);
-      if (amts.length) {
-        const v = amts[amts.length - 1].v;
-        if (OPENING.test(line.text) && opening === null) opening = v;
-        else if (CLOSING.test(line.text)) closing = v;
-      }
-      last = null;
+    if (header) {
+      afterHeader = rows.length > 0;
+      cols = header;
+      prefix = [];
       continue;
     }
-    if (!cols || isFurniture(line)) { last = null; continue; }
+
+    const first = line.phrases[0];
+    const dm = cols && first && first.x < cols.desc.x - 2 ? DATE_AT_START.exec(first.text) : null;
+    const date = dm ? parseAbaDate(dm[1].replace(/\s+/g, ' ')) : null;
+
+    if (!date && (OPENING.test(line.text) || CLOSING.test(line.text) || CARRIED.test(line.text))) {
+      const amts = line.phrases.map((p) => parseAmount(p.text)).filter((v): v is number => v !== null);
+      const v = amts[amts.length - 1];
+      if (v !== undefined) {
+        if (OPENING.test(line.text)) { if (opening === null && rows.length === 0) opening = v; }
+        else if (CLOSING.test(line.text)) closing = v;
+        // "carried forward" at the foot of a page is just a checkpoint, not the closing balance
+      }
+      rowOpen = false;
+      continue;
+    }
+    if (!cols) continue;
 
     const amountMinX = Math.min(cols.in.x, cols.out.x, cols.bal.x) - 15;
-    const first = line.phrases[0];
-    const startMatch = first && first.x < cols.desc.x - 2 ? ROW_DATE_AT_START.exec(first.text) : null;
-    const date = startMatch ? parseAbaDate(startMatch[1].replace(/\s+/g, ' ')) : null;
-    const amounts = amountPhrases(line).filter((a) => center(a.p) >= amountMinX);
+    const zone = line.phrases.filter((p) => center(p) >= amountMinX);
 
     if (date) {
-      let moneyIn = 0, moneyOut = 0, balance: number | null = null;
-      for (const a of amounts) {
-        const col = nearestColumn(a.p, [cols.in, cols.out, cols.bal]);
-        const v = Math.abs(a.v);
-        if (col === cols.bal) { if (balance !== null) throw rowError(line, 'two balances'); balance = a.v; }
-        else if (col === cols.in) moneyIn += v;
-        else moneyOut += v;
-      }
-      if (balance === null) throw rowError(line, 'no running balance');
+      const amounts = readAmounts(line, zone);
+      const bals = amounts.filter((a) => a.col === 'bal');
+      if (bals.length !== 1) throw rowError(line, bals.length ? 'two balances' : 'no running balance');
+      const moneyIn = round2(amounts.filter((a) => a.col === 'in').reduce((s, a) => s + Math.abs(a.v), 0));
+      const moneyOut = round2(amounts.filter((a) => a.col === 'out').reduce((s, a) => s + Math.abs(a.v), 0));
       if (moneyIn > 0 && moneyOut > 0) throw rowError(line, 'both Money In and Money Out');
       let time: string | null = null;
-      const descParts: string[] = [];
-      if (startMatch![2]) descParts.push(startMatch![2]);
+      const desc: string[] = [...prefix];
+      let rest = dm![2];
+      const tm = rest ? TIME_AT_START.exec(rest) : null;
+      if (tm && parseTime(tm[1])) { time = parseTime(tm[1]); rest = tm[2] ?? ''; }
+      if (rest) desc.push(rest);
       for (const p of line.phrases.slice(1)) {
-        if (amounts.some((a) => a.p === p)) continue;
+        if (center(p) >= amountMinX) continue;
         const t = center(p) < cols.desc.x ? parseTime(p.text) : null;
-        if (t) time = t; else descParts.push(p.text);
+        if (t) time = t;
+        else desc.push(p.text);
       }
-      rows.push({ date, time, description: descParts.join(' ').trim(), moneyIn: round2(moneyIn), moneyOut: round2(moneyOut), balance, section: 0, _page: line.page, _y: line.y });
+      rows.push({ date, time, description: desc.join(' ').trim(), moneyIn, moneyOut, balance: bals[0].v, section: 0 });
+      const ps = pageSum.get(line.page) ?? { in: 0, out: 0 };
+      ps.in += moneyIn; ps.out += moneyOut; total.in += moneyIn; total.out += moneyOut;
+      pageSum.set(line.page, ps);
       last = { page: line.page, y: line.y, h: line.h };
+      rowOpen = true;
+      afterHeader = false;
+      prefix = [];
       continue;
     }
 
+    const amounts = readAmounts(line, zone);
     if (amounts.length) {
-      if (/total/i.test(line.text)) { last = null; continue; }
+      // Only a totals line may carry amounts without a date, and its figures must match the rows.
+      if (TOTALS.test(line.text) && !amounts.some((a) => a.col === 'bal')) {
+        const ps = pageSum.get(line.page) ?? { in: 0, out: 0 };
+        for (const a of amounts) {
+          const want = a.col === 'in' ? [ps.in, total.in] : [ps.out, total.out];
+          if (!want.some((w) => sameMoney(round2(w), Math.abs(a.v), 0.01))) throw rowError(line, "a total that doesn't match the rows above");
+        }
+        rowOpen = false;
+        continue;
+      }
       throw rowError(line, 'amounts on a line without a date');
     }
 
-    // Continuation of the row above: same page, close below, inside the description/date columns.
-    const close = last && line.page === last.page && line.y - last.y <= Math.max(last.h, line.h) * 2.6;
-    const inColumns = line.phrases.every((p) => p.x >= cols!.date.x - 5 && center(p) < amountMinX);
-    if (close && inColumns && rows.length) {
+    // Text-only line: a wrapped description (below its row, or above the next one), or something else.
+    const text = line.text.trim();
+    if (NOT_A_PAYEE.test(text) || isNote(text)) { if (last && line.page === last.page) rowOpen = false; prefix = []; continue; }
+    const inDescColumn = line.phrases.every((p) => (p.x >= cols!.desc.x - 3 && center(p) < amountMinX) || (center(p) < cols!.desc.x && parseTime(p.text)));
+    if (!inDescColumn) { if (last && line.page === last.page) rowOpen = false; continue; }
+    const closeBelow = !!last && ((rowOpen && line.page === last.page && line.y - last.y <= Math.max(last.h, line.h) * 2.2) || (afterHeader && line.page > last.page));
+
+    // Vertically centred cells: if this line sits closer to the next date line than to the row above, it belongs below.
+    const next = lines.slice(i + 1, i + 4).find((l) => l.page === line.page && cols && l.phrases[0] && l.phrases[0].x < cols.desc.x - 2 && DATE_AT_START.test(l.phrases[0].text));
+    const gapAbove = last && line.page === last.page ? line.y - last.y : Infinity;
+    // (Not right after a repeated page header: there, a wrapped line carries over from the previous page.)
+    if (!(afterHeader && last && line.page > last.page) && next && next.y - line.y < gapAbove && next.y - line.y <= line.h * 1.5) {
+      prefix.push(text);
+      continue;
+    }
+    if (closeBelow && rows.length) {
       const row = rows[rows.length - 1];
       for (const p of line.phrases) {
         const t = center(p) < cols.desc.x ? parseTime(p.text) : null;
-        if (t && !row.time) row.time = t;
-        else if (center(p) >= cols.desc.x - 2) row.description = `${row.description} ${p.text}`.trim();
-        else if (!t) throw rowError(line, 'unexpected text in the date column');
+        if (t) { if (!row.time) row.time = t; }
+        else row.description = `${row.description} ${p.text}`.trim();
       }
       last = { page: line.page, y: line.y, h: line.h };
+      rowOpen = true;
+      afterHeader = false;
       continue;
     }
-    // Anything else (footers, notes, page furniture) is not part of a row.
-    last = null;
+    if (last && line.page === last.page) rowOpen = false;
+    afterHeader = false;
   }
 
-  // Order: oldest first. Some statements list newest first; detect from dates.
-  let ordered: ParsedRow[] = rows.map(({ _page, _y, ...r }) => r);
-  if (ordered.length > 1 && ordered[0].date > ordered[ordered.length - 1].date) {
-    // Newest first: reverse, and the balance chain runs the other way.
-    ordered = ordered.reverse();
-    notes.push('Rows were listed newest-first; reordered.');
-  }
-
+  const ordered = orderRows(rows, opening, notes);
   const derivedOpening = ordered.length ? round2(ordered[0].balance - ordered[0].moneyIn + ordered[0].moneyOut) : null;
   const open = opening ?? derivedOpening;
   if (open === null) throw new StatementError('ABA statement has no transactions and no opening balance. Nothing was saved.');
@@ -161,6 +238,22 @@ export function parseAba(lines: Line[]): ParsedStatement {
   };
 }
 
-function rowError(line: Line, why: string): StatementError {
-  return new StatementError(`ABA page ${line.page}: couldn't read a row (${why}): "${line.text.slice(0, 80)}". Stopped — nothing was saved.`);
+/**
+ * Oldest first. The running balances decide the order (not the dates, which can all be the same day):
+ * whichever order chains without a break is the right one.
+ */
+function orderRows(rows: ParsedRow[], opening: number | null, notes: string[]): ParsedRow[] {
+  if (rows.length < 2) return rows;
+  const chains = (rs: ParsedRow[]) => {
+    const open = opening ?? round2(rs[0].balance - rs[0].moneyIn + rs[0].moneyOut);
+    return firstBalanceBreak(open, rs) === -1;
+  };
+  const reversed = [...rows].reverse();
+  const asPrinted = chains(rows);
+  const backwards = chains(reversed);
+  if (backwards && (!asPrinted || rows[0].date > rows[rows.length - 1].date)) {
+    notes.push('Rows were listed newest-first; reordered.');
+    return reversed;
+  }
+  return rows;
 }

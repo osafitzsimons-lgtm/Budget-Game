@@ -24,9 +24,13 @@ export interface TxRow {
   savings: boolean;
   isCash: boolean;
   seq: number;
+  /** which copy of an otherwise identical row this is (part of the transaction's identity) */
+  dup: number;
 }
 
 export interface StatementSummary {
+  /** set by the browser on parts of a big statement that fill in history before the first saved one */
+  direction?: 'backfill';
   accountId: string;
   periodStart: string;
   periodEnd: string;
@@ -53,6 +57,11 @@ export interface ProofResult {
   baseline: boolean;
   checks: ProofCheck[];
   newRows: number;
+  /** index of the first/last row already saved (-1 if none): lets the browser split big statements */
+  firstKnown: number;
+  lastKnown: number;
+  /** which way the new rows join on to what's saved */
+  direction: 'baseline' | 'forward' | 'backfill' | 'overlap' | 'duplicate';
 }
 
 export interface LogEntry {
@@ -73,7 +82,7 @@ export interface ScoreEvent {
   id?: number;
   creatureId: number;
   weekStart: string;
-  kind: 'missing-upload' | 'proof-failing' | 'spend' | 'unlogged' | 'savings' | 'death' | 'birth';
+  kind: 'missing-upload' | 'proof-failing' | 'spend' | 'unlogged' | 'savings' | 'death' | 'birth' | 'settings';
   delta: number;
   reason: string;
   at: number;

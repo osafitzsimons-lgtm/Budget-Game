@@ -1,9 +1,9 @@
 import { useState } from 'preact/hooks';
 import { toCsv, parseHistoryCsv } from '../../shared/csv';
-import { hashRows } from '../../shared/hash';
+import { importHistory } from '../../shared/submit';
 import { usd } from '../../shared/money';
 import type { Phase, Settings } from '../../shared/settings';
-import { api } from '../api';
+import { api, post } from '../api';
 import type { ScreenProps } from '../app';
 
 function NumberField({ label, value, onChange, step = '1' }: { label: string; value: number; onChange: (n: number) => void; step?: string }) {
@@ -69,12 +69,7 @@ export function SettingsScreen({ state, reload }: ScreenProps) {
     const { rows, errors } = parseHistoryCsv(await file.text());
     if (errors.length) { setCsvMsg({ ok: false, text: `Nothing imported. ${errors.slice(0, 5).join(' ')}${errors.length > 5 ? ` (+${errors.length - 5} more)` : ''}` }); return; }
     try {
-      const hashes = await hashRows('csv', rows.map((r) => ({ date: r.date, time: null, payee: `${r.account}|${r.payee}`, amountOrig: r.amountUsd, balance: null })));
-      let inserted = 0, skipped = 0, learned = 0;
-      for (let i = 0; i < rows.length; i += 3000) {
-        const res = await api.importCsv(rows.slice(i, i + 3000).map((r, j) => ({ ...r, hash: hashes[i + j] })));
-        inserted += res.inserted; skipped += res.skipped; learned += res.rulesLearned;
-      }
+      const { inserted, skipped, rulesLearned: learned } = await importHistory(post, rows);
       await reload();
       setCsvMsg({ ok: true, text: `Imported ${inserted} rows (${skipped} already there). Learned ${learned} payee rules. History is filled in; health is not affected.` });
     } catch (e) { setCsvMsg({ ok: false, text: e instanceof Error ? e.message : String(e) }); }

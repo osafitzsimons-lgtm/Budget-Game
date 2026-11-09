@@ -48,13 +48,35 @@ At 0 he dies and goes in the graveyard. The app shows "$25 extra to savings next
 - **Imported CSV history** fills History until the first uploaded statement for that bank. From then on only statements are used, so nothing is counted twice.
 - **Payees:** any run of 6 or more digits (account or card numbers) is reduced to its last three, e.g. `•••659`.
 
+## Reading statements
+
+The PDF readers would rather stop with a clear message than guess. They stop when:
+- the layout or currency is unknown,
+- an amount can't be read exactly,
+- a row has no date or no running balance,
+- the balances don't chain, or a total doesn't match the rows,
+- two different account numbers appear in one PDF.
+
+They handle these layouts correctly:
+- **Wrapped descriptions:** lines that continue onto the next page are kept with their row.
+- **Repeated text:** headers, footers and notes are skipped, including "Continued on next page", "END OF STATEMENT" and the Revolut legal text.
+- **Duplicate text layers:** fake-bold text and hidden scanned-text layers are read once, not twice.
+- **Stamps and placeholders:** stamps such as "COPY" and "-" placeholders in empty amount columns are ignored.
+- **Newest-first statements:** the order is fixed using the balances.
+- **Revolut:** the account's own balance-summary line is used, not a pocket's.
+
+Account numbers are only read next to a label ("Account No", "A/C No", "IBAN"), so phone numbers and postcodes are never mistaken for one.
+
+If one of your real statements is refused, run `npx tsx scripts/dump-pdf.ts your.pdf 80` on your computer to see what the app sees.
+
 ## Stack
 
 TypeScript, Cloudflare Worker with static assets, D1, Preact, Vite and Vitest. It fits the Workers free plan:
 
 - Only `/api/*` runs Worker code.
 - Database writes are batched into single `json_each` inserts.
-- Confirming an 849-row statement takes about 3.5 ms of CPU in a local benchmark.
+- Big statements are checked once, then saved in parts of at most 250 rows. Each part is a complete mini-statement that the server re-checks.
+- In local benchmarks each request takes under 7 ms of CPU, and `tests/limits.test.ts` keeps it that way.
 
 ```
 src/parsers   PDF text → lines → ABA / Revolut statements (pure, runs in browser and tests)

@@ -12,6 +12,7 @@ CREATE INDEX IF NOT EXISTS logs_date ON logs(date);
 CREATE TABLE IF NOT EXISTS creatures (id INTEGER PRIMARY KEY, name TEXT NOT NULL, born_at INTEGER NOT NULL, died_at INTEGER, start_health INTEGER NOT NULL, health INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS score_events (id INTEGER PRIMARY KEY AUTOINCREMENT, creature_id INTEGER NOT NULL, week_start TEXT NOT NULL, kind TEXT NOT NULL, delta INTEGER NOT NULL, reason TEXT NOT NULL, at INTEGER NOT NULL, health_after INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS week_evals (week_start TEXT PRIMARY KEY, evaluated_at INTEGER NOT NULL, early INTEGER NOT NULL, data_ok INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS upload_seq (account_id TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (account_id, seq));
 CREATE TABLE IF NOT EXISTS late_evals (week_start TEXT PRIMARY KEY, evaluated_at INTEGER NOT NULL);
 INSERT OR IGNORE INTO accounts (id, bank, last3, label, optional, active, sort) VALUES ('ABA-812', 'ABA', '812', 'ABA 812', 0, 1, 1), ('ABA-013', 'ABA', '013', 'ABA 013', 0, 1, 2), ('ABA-811', 'ABA', '811', 'ABA 811', 1, 1, 3), ('REV-554', 'REV', '554', 'Revolut 554', 0, 1, 4);
 INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');

@@ -24,6 +24,11 @@ const GRAB = /\bgrab\b/i;
 const TADA = /\btada\b/i;
 const CASH = /\b(cash withdrawal|atm withdrawal|cash wdl|atm|withdrawal at)\b/i;
 
+/** A cash withdrawal (counts as negotiable spending when withdrawn). */
+export function isCashPayee(payee: string): boolean {
+  return CASH.test(payee);
+}
+
 /** Payees covered by built-in rules. These are never learned, so the amount rules always win. */
 export function isBuiltInPayee(payee: string): boolean {
   return GRAB.test(payee) || TADA.test(payee) || CASH.test(payee);

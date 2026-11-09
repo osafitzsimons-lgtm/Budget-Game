@@ -2,7 +2,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { parseHistoryCsv } from '../src/shared/csv';
-import { hashRows } from '../src/shared/hash';
+import { importHistory } from '../src/shared/submit';
 import { writeSampleData } from './sample-data';
 
 const PORT = 8787;
@@ -20,8 +20,11 @@ async function seed() {
     await new Promise((r) => setTimeout(r, 1000));
   }
   const { rows } = parseHistoryCsv(readFileSync(`${dir}/sample-history.csv`, 'utf8'));
-  const hashes = await hashRows('csv', rows.map((r) => ({ date: r.date, time: null, payee: `${r.account}|${r.payee}`, amountOrig: r.amountUsd, balance: null })));
-  const res = await fetch(`${base}/api/import-csv`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: base }, body: JSON.stringify({ rows: rows.map((r, i) => ({ ...r, hash: hashes[i] })) }) });
-  console.log(`\n› Fake history imported (${res.status}). Open ${base} in your browser.\n`);
+  const post = async <T,>(path: string, body: unknown): Promise<T> => {
+    const r = await fetch(`${base}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: base }, body: JSON.stringify(body) });
+    return (await r.json()) as T;
+  };
+  const res = await importHistory(post, rows);
+  console.log(`\n› Fake history imported (${res.inserted} rows). Open ${base} in your browser.\n`);
 }
 void seed();
