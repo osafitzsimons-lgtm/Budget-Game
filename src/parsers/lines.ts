@@ -49,6 +49,8 @@ export function toPhrases(items: TextItem[]): Phrase[] {
     const text = it.str.replace(/\s+/g, ' ');
     if (!text.trim()) continue;
     const prev = out[out.length - 1];
+    // A copy of text already on this line, drawn over itself (hidden OCR layer): skip it.
+    if (prev && it.x < prev.right - it.w * 0.5 && prev.text.includes(text.trim())) continue;
     // Merge when the gap is smaller than roughly one character width.
     const gap = prev ? it.x - prev.right : Infinity;
     if (prev && gap < Math.max(1.5, it.h * 0.6)) {
@@ -64,17 +66,37 @@ export function toPhrases(items: TextItem[]): Phrase[] {
 }
 
 /** Group items into lines: items whose baselines are within a fraction of the text height share a line. */
+/**
+ * Clean up pdf.js output for one page: drop exact copies of a piece of text drawn again within a couple of
+ * points (fake bold, hidden OCR layers) and stamp/watermark text far bigger than the body text ("COPY").
+ */
+function cleanItems(items: TextItem[]): TextItem[] {
+  const bodyH = median(items.map((i) => i.h));
+  const kept: TextItem[] = [];
+  const seen = new Map<string, TextItem[]>();
+  for (const it of items) {
+    if (bodyH > 0 && it.h > bodyH * 2.2) continue;
+    const key = it.str.trim();
+    const near = seen.get(key) ?? [];
+    if (near.some((o) => Math.abs(o.x - it.x) <= 2 && Math.abs(o.y - it.y) <= 2)) continue;
+    near.push(it);
+    seen.set(key, near);
+    kept.push(it);
+  }
+  return kept;
+}
+
 export function groupLines(items: TextItem[]): Line[] {
   const pages = new Map<number, TextItem[]>();
   for (const it of items) {
-    if (!it.str.trim()) continue;
+    if (!it.str.trim() || !Number.isFinite(it.x) || !Number.isFinite(it.y)) continue;
     const list = pages.get(it.page) ?? [];
     list.push(it);
     pages.set(it.page, list);
   }
   const lines: Line[] = [];
   for (const page of [...pages.keys()].sort((a, b) => a - b)) {
-    const its = pages.get(page)!.sort((a, b) => a.y - b.y || a.x - b.x);
+    const its = cleanItems(pages.get(page)!).sort((a, b) => a.y - b.y || a.x - b.x);
     const tol = Math.max(1, median(its.map((i) => i.h)) * 0.35);
     let cur: TextItem[] = [];
     let curY = -Infinity;

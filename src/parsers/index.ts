@@ -11,8 +11,11 @@ export function parseStatementItems(items: TextItem[]): ParsedStatement {
   if (!items.some((i) => i.str.trim()))
     throw new StatementError('This PDF has no readable text (it may be a scan or photo). Download the statement as a PDF from the bank app instead.');
   const lines = groupLines(items);
-  if (looksLikeRevolut(lines)) return parseRevolut(lines);
-  if (looksLikeAba(lines)) return parseAba(lines);
+  const rev = looksLikeRevolut(lines);
+  const aba = looksLikeAba(lines);
+  if (rev && aba) throw new StatementError('This PDF looks like both an ABA and a Revolut statement. Upload one statement per PDF. Nothing was saved.');
+  if (rev) return parseRevolut(lines);
+  if (aba) return parseAba(lines);
   throw new StatementError("Unrecognised statement layout. Only ABA (USD) and Revolut (GBP) PDF statements are supported. Nothing was saved.");
 }
 

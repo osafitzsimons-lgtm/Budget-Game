@@ -11,6 +11,7 @@ export function parseAmount(text: string): number | null {
   let neg = false;
   if (/^\(.*\)$/.test(s)) { neg = true; s = s.slice(1, -1); }
   if (s.startsWith('-') || s.startsWith('−')) { neg = true; s = s.slice(1); }
+  else if (s.startsWith('+')) s = s.slice(1);
   s = s.replace(/^[£$]/, '');
   if (s.startsWith('-')) { neg = true; s = s.slice(1); }
   if (!/^(\d{1,3}(,\d{3})+|\d+)\.\d{2}$/.test(s)) return null;
